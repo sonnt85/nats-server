@@ -827,20 +827,54 @@ func (s *Server) setLeafNodeInfoHostPortAndIP() error {
 }
 
 func (s *Server) addLeafNodeConnection(c *client) {
+	var accName string
 	c.mu.Lock()
 	cid := c.cid
+	// Grap account name for accepted leaf node connection only.
+	if c.acc != nil && c.leaf != nil && c.leaf.remote == nil {
+		accName = c.acc.Name
+	}
 	c.mu.Unlock()
 	s.mu.Lock()
 	s.leafs[cid] = c
+	if accName != _EMPTY_ {
+		var refs int
+		if s.leafNodeAccNamesMap == nil {
+			s.leafNodeAccNamesMap = make(map[string]int)
+		} else {
+			refs = s.leafNodeAccNamesMap[accName]
+		}
+		refs++
+		s.leafNodeAccNamesMap[accName] = refs
+		if refs == 1 {
+			s.leafNodeAccChanged = true
+		}
+	}
 	s.mu.Unlock()
 }
 
 func (s *Server) removeLeafNodeConnection(c *client) {
+	var accName string
 	c.mu.Lock()
 	cid := c.cid
+	// Grap account name for accepted leaf node connection only.
+	if c.acc != nil && c.leaf != nil && c.leaf.remote == nil {
+		accName = c.acc.Name
+	}
 	c.mu.Unlock()
 	s.mu.Lock()
 	delete(s.leafs, cid)
+	if accName != _EMPTY_ && s.leafNodeAccNamesMap != nil {
+		refs := s.leafNodeAccNamesMap[accName]
+		refs--
+		if refs > 0 {
+			s.leafNodeAccNamesMap[accName] = refs
+		}
+		if refs <= 0 {
+			delete(s.leafNodeAccNamesMap, accName)
+			s.leafNodeAccChanged = true
+		}
+	}
 	s.mu.Unlock()
 }
 

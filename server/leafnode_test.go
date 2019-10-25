@@ -724,3 +724,108 @@ func TestLeafNodeBasicAuthMultiple(t *testing.T) {
 		t.Fatalf("Expected timeout error, got %v", err)
 	}
 }
+
+func TestLeafNodeAccountsMap(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Accounts = []*Account{NewAccount("A"), NewAccount("B")}
+	opts.LeafNode.Port = -1
+	opts.LeafNode.Users = []*User{
+		&User{Username: "userA", Password: "pwd", Account: opts.Accounts[0]},
+		&User{Username: "userB", Password: "pwd", Account: opts.Accounts[1]},
+	}
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	connectLeaf := func(t *testing.T, user, accName string) *Server {
+		t.Helper()
+		u, _ := url.Parse(fmt.Sprintf("nats://%s:pwd@127.0.0.1:%d", user, opts.LeafNode.Port))
+		o := DefaultOptions()
+		o.Accounts = []*Account{NewAccount(accName)}
+		o.LeafNode.Remotes = []*RemoteLeafOpts{
+			{
+				LocalAccount: accName,
+				URLs:         []*url.URL{u},
+			},
+		}
+		s := RunServer(o)
+
+		checkLeafNodeConnected(t, s)
+		return s
+	}
+
+	ln1 := connectLeaf(t, "userA", "A")
+	defer ln1.Shutdown()
+
+	checkRefs := func(t *testing.T, s *Server, accName string, expectedExist, expectedChanged bool, expectedRefs int) {
+		t.Helper()
+		s.mu.Lock()
+		refs, ok := s.leafNodeAccNamesMap[accName]
+		changed := s.leafNodeAccChanged
+		s.mu.Unlock()
+		if !expectedExist && ok {
+			t.Fatalf("Account %q should not be on the map, but it was", accName)
+		} else if expectedExist && !ok {
+			t.Fatalf("Account %q should have been in the map, but it wasn't", accName)
+		}
+		if refs != expectedRefs {
+			t.Fatalf("Expected ref count for account %q to be %v, got %v", accName, expectedRefs, refs)
+		}
+		if changed != expectedChanged {
+			t.Fatalf("Expected changed bool for account %q to be %v, got %v", accName, expectedChanged, changed)
+		}
+		accs := s.getLeafNodesAccounts()
+		for _, a := range accs {
+			if a == accName {
+				if expectedExist {
+					return
+				}
+				t.Fatalf("Account %q should not have been in the array %+v", accName, accs)
+			}
+		}
+	}
+	checkRefs(t, s, "A", true, true, 1)
+	// We don't stop in the soliciting server...
+	checkRefs(t, ln1, "A", false, false, 0)
+
+	ln2 := connectLeaf(t, "userA", "A")
+	defer ln2.Shutdown()
+
+	checkRefs(t, s, "A", true, false, 2)
+	checkRefs(t, ln1, "A", false, false, 0)
+	checkRefs(t, ln2, "A", false, false, 0)
+
+	disconnectLeaf := func(t *testing.T, s, ln *Server, expectedLeft int) {
+		t.Helper()
+		ln.Shutdown()
+		checkFor(t, time.Second, 15*time.Millisecond, func() error {
+			if n := s.NumLeafNodes(); n != expectedLeft {
+				return fmt.Errorf("Expected %d leaf node(s), got %v", expectedLeft, n)
+			}
+			return nil
+		})
+	}
+	disconnectLeaf(t, s, ln2, 1)
+
+	checkRefs(t, s, "A", true, false, 1)
+	checkRefs(t, ln1, "A", false, false, 0)
+
+	// Create a new one on different account
+	ln3 := connectLeaf(t, "userB", "B")
+	defer ln3.Shutdown()
+
+	checkRefs(t, s, "B", true, true, 1)
+	checkRefs(t, ln1, "A", false, false, 0)
+	checkRefs(t, ln1, "B", false, false, 0)
+	checkRefs(t, ln3, "A", false, false, 0)
+	checkRefs(t, ln3, "B", false, false, 0)
+
+	// Shutdown ln1, which should remove "A" from map
+	disconnectLeaf(t, s, ln1, 1)
+	checkRefs(t, s, "A", false, true, 0)
+	checkRefs(t, ln3, "A", false, false, 0)
+	checkRefs(t, ln3, "B", false, false, 0)
+
+	// Finally ln3..
+	disconnectLeaf(t, s, ln3, 0)
+	checkRefs(t, s, "B", false, true, 0)
+}

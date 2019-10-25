@@ -132,6 +132,13 @@ type Server struct {
 		resolver    netResolver
 		dialTimeout time.Duration
 	}
+	// This is to store (and ref count) accounts used by leaf nodes.
+	// We use that with gateways.
+	leafNodeAccNamesMap map[string]int
+	// Indicate that the map above was changed. This is optimization
+	// to build array needed for serialization only when needed
+	leafNodeAccChanged bool
+	leafNodeAccNames   []string
 
 	quitCh chan struct{}
 
@@ -2531,4 +2538,21 @@ func (s *Server) setFirstPingTimer(c *client) {
 		d = firstPingInterval
 	}
 	c.ping.tmr = time.AfterFunc(d, c.processPingTimer)
+}
+
+// Returns the list of all account names
+func (s *Server) getLeafNodesAccounts() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.leafNodeAccChanged {
+		return s.leafNodeAccNames
+	}
+	// Rebuild...
+	accs := make([]string, 0, len(s.leafNodeAccNamesMap))
+	for accName := range s.leafNodeAccNamesMap {
+		accs = append(accs, accName)
+	}
+	s.leafNodeAccNames = accs
+	s.leafNodeAccChanged = false
+	return accs
 }
