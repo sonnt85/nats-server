@@ -2156,15 +2156,6 @@ func TestLeafNodeResetsMSGProto(t *testing.T) {
 	s := RunServer(opts)
 	defer s.Shutdown()
 
-	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
-	defer lc.Close()
-
-	leafSend, leafExpect := setupConn(t, lc)
-
-	// To avoid possible INFO when switching to interest mode only,
-	// delay start of gateway.
-	time.Sleep(500 * time.Millisecond)
-
 	gw := createGatewayConn(t, opts.Gateway.Host, opts.Gateway.Port)
 	defer gw.Close()
 
@@ -2172,12 +2163,31 @@ func TestLeafNodeResetsMSGProto(t *testing.T) {
 	gwSend("PING\r\n")
 	gwExpect(pongRe)
 
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	leafSend, leafExpect := setupConn(t, lc)
+
 	// This is for our global responses since we are setting up GWs above.
 	leafExpect(lsubRe)
+
+	buf := gwExpect(infoRe)
+	if m := infoRe.FindAllSubmatch(buf, -1); len(m) != 2 {
+		gwExpect(infoRe)
+	}
+	gwExpect(pingRe)
+	gwSend("PONG\r\n")
+
+	// Wait for the first PING that we receive on LEAF (for RTT)
+	leafExpect(pingRe)
+	leafSend("PONG\r\n")
 
 	// Now setup interest in the leaf node for 'foo'.
 	leafSend("LS+ foo\r\nPING\r\n")
 	leafExpect(pongRe)
+
+	// This should be propagated to the GW server
+	gwExpect(rsubRe)
 
 	// Send msg from the gateway.
 	gwSend("RMSG $G foo 2\r\nok\r\nPING\r\n")

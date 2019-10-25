@@ -67,6 +67,7 @@ const (
 	gatewayCmdGossip          byte = 1
 	gatewayCmdAllSubsStart    byte = 2
 	gatewayCmdAllSubsComplete byte = 3
+	gatewayCmdListOfAccounts  byte = 4
 )
 
 // GatewayInterestMode represents an account interest mode for a gateway connection
@@ -664,10 +665,22 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 	}
 
 	// Generate INFO to send
+	var cmdPayload []byte
+	var err error
+	if solicit {
+		_, cmdPayload, err = s.getLeafNodesAccountNames()
+		if err != nil {
+			c.Errorf("Unable to compress list of accounts for gateway connection to %q: %v", cfg.Name, err)
+		}
+	}
 	s.gateway.RLock()
 	// Make a copy
 	info := *s.gateway.info
 	info.GatewayURLs = s.gateway.getURLs()
+	if len(cmdPayload) > 0 {
+		info.GatewayCmd = gatewayCmdListOfAccounts
+		info.GatewayCmdPayload = cmdPayload
+	}
 	s.gateway.RUnlock()
 	b, _ := json.Marshal(&info)
 	infoJSON := []byte(fmt.Sprintf(InfoProto, b))
@@ -860,6 +873,35 @@ func (c *client) processGatewayConnect(arg []byte) error {
 	return nil
 }
 
+// Switch the given inbound GW connection to interest-only mode
+// for all leaf nodes accounts, or all accounts received in the Info
+// protocol (if the other side has leaf node accounts).
+func (s *Server) switchInboundGWToInterestModeForLeafNodesAccounts(c *client, info *Info) {
+	accNames, _, err := s.getLeafNodesAccountNames()
+	if err != nil {
+		c.Errorf("Unable to switch inbound gateway connection to interest-only mode for leafnode accounts: %v", err)
+		return
+	}
+	// Switch leafnode's account if applicable
+	if len(accNames) > 0 {
+		for _, accName := range accNames {
+			switchInboundGWToInterestModeForAccount(c, accName)
+		}
+	}
+	// And/or, if the incoming INFO contained a list of accounts, then
+	// switch this inbound GW to interest-only mode for those accounts too.
+	if info.GatewayCmd == gatewayCmdListOfAccounts && len(info.GatewayCmdPayload) > 0 {
+		accNames, err := deserializeListOfStrings(info.GatewayCmdPayload)
+		if err != nil {
+			c.Errorf("Unable to decode list of accounts: %v", err)
+			return
+		}
+		for _, accName := range accNames {
+			switchInboundGWToInterestModeForAccount(c, accName)
+		}
+	}
+}
+
 // Process the INFO protocol from a gateway connection.
 //
 // If the gateway connection is an outbound (this server initiated the connection),
@@ -1011,6 +1053,11 @@ func (c *client) processGatewayInfo(info *Info) {
 		// Send back to the server that initiated this gateway connection the
 		// list of all remote gateways known on this server.
 		s.gossipGatewaysToInboundGateway(info.Gateway, c)
+
+		// Switch this inbound GW connection to interest-only mode for
+		// leafnodes accounts on this server and/or list of accounts
+		// sent by the other side.
+		s.switchInboundGWToInterestModeForLeafNodesAccounts(c, info)
 	}
 }
 
@@ -1939,27 +1986,35 @@ func (c *client) gatewayInterest(acc, subj string) (bool, *SublistResult) {
 }
 
 // switchAccountToInterestMode will switch an account over to interestMode.
-// Lock should NOT be held.
+// This is invoked when a leafnode connects, or this server receives
+// a system event regarding the connection of a leafnode with this account.
 func (s *Server) switchAccountToInterestMode(accName string) {
 	gwsa := [16]*client{}
 	gws := gwsa[:0]
 	s.getInboundGatewayConnections(&gws)
 
 	for _, gin := range gws {
-		var e *insie
-		var ok bool
-
-		gin.mu.Lock()
-		if e, ok = gin.gw.insim[accName]; !ok || e == nil {
-			e = &insie{}
-			gin.gw.insim[accName] = e
-		}
-		// Do it only if we are in Optimistic mode
-		if e.mode == Optimistic {
-			gin.gatewaySwitchAccountToSendAllSubs(e, accName)
-		}
-		gin.mu.Unlock()
+		switchInboundGWToInterestModeForAccount(gin, accName)
 	}
+}
+
+// Sends a protocol message for the given inbound GW connection to
+// switch the given account to interest-only mode.
+// Client lock should NOT be held on entry.
+func switchInboundGWToInterestModeForAccount(gin *client, accName string) {
+	var e *insie
+	var ok bool
+
+	gin.mu.Lock()
+	if e, ok = gin.gw.insim[accName]; !ok || e == nil {
+		e = &insie{}
+		gin.gw.insim[accName] = e
+	}
+	// Do it only if we are in Optimistic mode
+	if e.mode == Optimistic {
+		gin.gatewaySwitchAccountToSendAllSubs(e, accName)
+	}
+	gin.mu.Unlock()
 }
 
 // This is invoked when registering (or unregistering) the first

@@ -14,8 +14,12 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/url"
 	"reflect"
@@ -109,4 +113,68 @@ func parseHostPort(hostPort string, defaultPort int) (host string, port int, err
 // false otherwise.
 func urlsAreEqual(u1, u2 *url.URL) bool {
 	return reflect.DeepEqual(u1, u2)
+}
+
+func serializeListOfStrings(compressThreshold int, strings []string) ([]byte, error) {
+	type listStrings struct {
+		Strings []string `json:"strings"`
+	}
+	l := &listStrings{Strings: strings}
+	// Serialize data
+	stringsb, err := json.Marshal(l)
+	if err != nil {
+		return nil, err
+	}
+	compress := len(stringsb) > compressThreshold
+	b := &bytes.Buffer{}
+	if !compress {
+		b.Write([]byte{0})
+		b.Write(stringsb)
+	} else {
+		// Indicate that following is compressed data
+		b.Write([]byte{1})
+		// Create compressor
+		w := gzip.NewWriter(b)
+		// Compress
+		if _, err := w.Write(stringsb); err != nil {
+			return nil, err
+		}
+		// Need to close to finish compression
+		if err := w.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return b.Bytes(), nil
+}
+
+func deserializeListOfStrings(encodedStrings []byte) ([]string, error) {
+	if len(encodedStrings) <= 1 {
+		return nil, fmt.Errorf("corrupted data")
+	}
+	type listStrings struct {
+		Strings []string `json:"strings"`
+	}
+	var data []byte
+	encoding := encodedStrings[0]
+	switch encoding {
+	case 0:
+		data = encodedStrings[1:]
+	case 1:
+		gr, err := gzip.NewReader(bytes.NewBuffer(encodedStrings[1:]))
+		if err != nil {
+			return nil, err
+		}
+		defer gr.Close()
+		data, err = ioutil.ReadAll(gr)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unknown compression mode: %v", encoding)
+	}
+	l := &listStrings{}
+	if err := json.Unmarshal(data, l); err != nil {
+		return nil, err
+	}
+	return l.Strings, nil
 }

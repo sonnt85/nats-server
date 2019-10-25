@@ -16,7 +16,9 @@ package server
 import (
 	"math/rand"
 	"net/url"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -200,5 +202,54 @@ func BenchmarkMapRange(b *testing.B) {
 		for range subs {
 			break
 		}
+	}
+}
+
+func TestCodeDecodeListOfStrings(t *testing.T) {
+	list := []string{"abc", "def", "ghi", "jkl"}
+	for _, test := range []struct {
+		name       string
+		threshold  int
+		compressed byte
+	}{
+		{"not compressed", 1024, 0},
+		{"compressed", 0, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sl, err := serializeListOfStrings(test.threshold, list)
+			if err != nil {
+				t.Fatalf("Error during serialization: %v", err)
+			}
+			compressed := sl[0]
+			if test.compressed != compressed {
+				t.Fatalf("Expected compression to be %v, got %v", test.compressed, compressed)
+			}
+
+			ul, err := deserializeListOfStrings(sl)
+			if err != nil {
+				t.Fatalf("Error during deserialization: %v", err)
+			}
+			if !reflect.DeepEqual(list, ul) {
+				t.Fatalf("Expected list to be %+v, got %+v", list, ul)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name          string
+		encodedString []byte
+		expectedErr   string
+	}{
+		{"encoded string too small", []byte{1}, "corrupted"},
+		{"unknown encoding", []byte{2, 3, 4, 5}, "unknown"},
+		{"invalid gzip", []byte{1, 2}, "unexpected"},
+		{"unmarshal error", []byte{0, 1, 2, 3}, "invalid"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := deserializeListOfStrings(test.encodedString)
+			if err == nil || !strings.Contains(err.Error(), test.expectedErr) {
+				t.Fatalf("Expected error to contain %q, was %q", test.expectedErr, err.Error())
+			}
+		})
 	}
 }

@@ -47,6 +47,10 @@ const (
 
 	// Interval for the first PING for non client connections.
 	firstPingInterval = time.Second
+
+	// Size of the JSNO serialization of account names after which
+	// the list is gzip'ed.
+	serializedAccountsCompressThreshold = 1024
 )
 
 // Make this a variable so that we can change during tests
@@ -134,11 +138,13 @@ type Server struct {
 	}
 	// This is to store (and ref count) accounts used by leaf nodes.
 	// We use that with gateways.
-	leafNodeAccNamesMap map[string]int
-	// Indicate that the map above was changed. This is optimization
-	// to build array needed for serialization only when needed
-	leafNodeAccChanged bool
-	leafNodeAccNames   []string
+	leafNodeAccs struct {
+		mu           sync.Mutex
+		m            map[string]int // Key is account name, value is ref count
+		list         []string       // Account names as an array
+		serialized   []byte         // Serialization of account names (possibly gzip'ed)
+		needsRebuild bool           // As the map changed since last serialization
+	}
 
 	quitCh chan struct{}
 
@@ -2540,19 +2546,75 @@ func (s *Server) setFirstPingTimer(c *client) {
 	c.ping.tmr = time.AfterFunc(d, c.processPingTimer)
 }
 
-// Returns the list of all account names
-func (s *Server) getLeafNodesAccounts() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.leafNodeAccChanged {
-		return s.leafNodeAccNames
+// Returns the all leaf nodes' account names as an array of
+// string (no duplicate) and a serialized version suitable to
+// send to other servers. The serialized form may be gzip'ed
+// to reduce size.
+func (s *Server) getLeafNodesAccountNames() ([]string, []byte, error) {
+	lna := &s.leafNodeAccs
+	lna.mu.Lock()
+	defer lna.mu.Unlock()
+	if !lna.needsRebuild {
+		return lna.list, lna.serialized, nil
 	}
-	// Rebuild...
-	accs := make([]string, 0, len(s.leafNodeAccNamesMap))
-	for accName := range s.leafNodeAccNamesMap {
+	// Needs a rebuild here...
+	accs := make([]string, 0, len(lna.m))
+	for accName := range lna.m {
 		accs = append(accs, accName)
 	}
-	s.leafNodeAccNames = accs
-	s.leafNodeAccChanged = false
-	return accs
+	b, err := serializeListOfStrings(serializedAccountsCompressThreshold, accs)
+	if err != nil {
+		return nil, nil, err
+	}
+	lna.list = accs
+	lna.serialized = b
+	lna.needsRebuild = false
+	return accs, b, nil
+}
+
+// Adds this account name to the list of account names for leaf nodes.
+// If the account name has already been added, the ref count for this
+// name is incremented.
+func (s *Server) addLeafNodeAccountName(accName string) {
+	if accName == _EMPTY_ {
+		return
+	}
+	lna := &s.leafNodeAccs
+	lna.mu.Lock()
+	var refs int
+	if lna.m == nil {
+		lna.m = make(map[string]int)
+	} else {
+		refs = lna.m[accName]
+	}
+	refs++
+	lna.m[accName] = refs
+	if refs == 1 {
+		lna.needsRebuild = true
+	}
+	lna.mu.Unlock()
+}
+
+// Removes this account name from the list of account names for leaf nodes.
+// If there are more than 1 leaf node with this account name, the ref count
+// is simply decremented. The name is actually removed only when the count
+// reaches 0.
+func (s *Server) removeLeafNodeAccountName(accName string) {
+	if accName == _EMPTY_ {
+		return
+	}
+	lna := &s.leafNodeAccs
+	lna.mu.Lock()
+	if lna.m != nil {
+		refs := lna.m[accName]
+		refs--
+		if refs > 0 {
+			lna.m[accName] = refs
+		}
+		if refs <= 0 {
+			delete(lna.m, accName)
+			lna.needsRebuild = true
+		}
+	}
+	lna.mu.Unlock()
 }

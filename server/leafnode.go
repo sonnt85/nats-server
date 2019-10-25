@@ -837,20 +837,8 @@ func (s *Server) addLeafNodeConnection(c *client) {
 	c.mu.Unlock()
 	s.mu.Lock()
 	s.leafs[cid] = c
-	if accName != _EMPTY_ {
-		var refs int
-		if s.leafNodeAccNamesMap == nil {
-			s.leafNodeAccNamesMap = make(map[string]int)
-		} else {
-			refs = s.leafNodeAccNamesMap[accName]
-		}
-		refs++
-		s.leafNodeAccNamesMap[accName] = refs
-		if refs == 1 {
-			s.leafNodeAccChanged = true
-		}
-	}
 	s.mu.Unlock()
+	s.addLeafNodeAccountName(accName)
 }
 
 func (s *Server) removeLeafNodeConnection(c *client) {
@@ -864,18 +852,8 @@ func (s *Server) removeLeafNodeConnection(c *client) {
 	c.mu.Unlock()
 	s.mu.Lock()
 	delete(s.leafs, cid)
-	if accName != _EMPTY_ && s.leafNodeAccNamesMap != nil {
-		refs := s.leafNodeAccNamesMap[accName]
-		refs--
-		if refs > 0 {
-			s.leafNodeAccNamesMap[accName] = refs
-		}
-		if refs <= 0 {
-			delete(s.leafNodeAccNamesMap, accName)
-			s.leafNodeAccChanged = true
-		}
-	}
 	s.mu.Unlock()
+	s.removeLeafNodeAccountName(accName)
 }
 
 type leafConnectInfo struct {

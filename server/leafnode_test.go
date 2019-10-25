@@ -756,12 +756,13 @@ func TestLeafNodeAccountsMap(t *testing.T) {
 	ln1 := connectLeaf(t, "userA", "A")
 	defer ln1.Shutdown()
 
-	checkRefs := func(t *testing.T, s *Server, accName string, expectedExist, expectedChanged bool, expectedRefs int) {
+	checkRefs := func(t *testing.T, s *Server, accName string, expectedExist, expectedRebuild bool, expectedRefs int) {
 		t.Helper()
-		s.mu.Lock()
-		refs, ok := s.leafNodeAccNamesMap[accName]
-		changed := s.leafNodeAccChanged
-		s.mu.Unlock()
+		lna := &s.leafNodeAccs
+		lna.mu.Lock()
+		refs, ok := lna.m[accName]
+		needsRebuild := lna.needsRebuild
+		lna.mu.Unlock()
 		if !expectedExist && ok {
 			t.Fatalf("Account %q should not be on the map, but it was", accName)
 		} else if expectedExist && !ok {
@@ -770,10 +771,10 @@ func TestLeafNodeAccountsMap(t *testing.T) {
 		if refs != expectedRefs {
 			t.Fatalf("Expected ref count for account %q to be %v, got %v", accName, expectedRefs, refs)
 		}
-		if changed != expectedChanged {
-			t.Fatalf("Expected changed bool for account %q to be %v, got %v", accName, expectedChanged, changed)
+		if needsRebuild != expectedRebuild {
+			t.Fatalf("Expected rebuild bool for account %q to be %v, got %v", accName, expectedRebuild, needsRebuild)
 		}
-		accs := s.getLeafNodesAccounts()
+		accs, _, _ := s.getLeafNodesAccountNames()
 		for _, a := range accs {
 			if a == accName {
 				if expectedExist {
@@ -828,4 +829,84 @@ func TestLeafNodeAccountsMap(t *testing.T) {
 	// Finally ln3..
 	disconnectLeaf(t, s, ln3, 0)
 	checkRefs(t, s, "B", false, true, 0)
+}
+
+func TestLeafNodeWithGateways(t *testing.T) {
+	oa := testDefaultOptionsForGateway("A")
+	oa.Accounts = []*Account{NewAccount("SYS")}
+	oa.SystemAccount = "SYS"
+	oa.LeafNode.Port = -1
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	ob := testGatewayOptionsFromToWithServers(t, "B", "A", sa)
+	ob.Accounts = []*Account{NewAccount("SYS")}
+	ob.SystemAccount = "SYS"
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, time.Second)
+	waitForOutboundGateways(t, sb, 1, time.Second)
+	waitForInboundGateways(t, sa, 1, time.Second)
+	waitForInboundGateways(t, sb, 1, time.Second)
+
+	setRecSubExp := func(s *Server) {
+		s.mu.Lock()
+		s.gateway.recSubExp = 10 * time.Millisecond
+		s.mu.Unlock()
+	}
+	setRecSubExp(sb)
+
+	lso := DefaultOptions()
+	u, _ := url.Parse(fmt.Sprintf("nats://%s:%d", oa.LeafNode.Host, oa.LeafNode.Port))
+	lso.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+	ls := RunServer(lso)
+	defer ls.Shutdown()
+
+	// Create a responder on ls
+	ncResp := natsConnect(t, ls.ClientURL())
+	defer ncResp.Close()
+	respSub := natsSubSync(t, ncResp, "foo")
+
+	checkReqReply := func(t *testing.T) {
+		t.Helper()
+
+		// Create a connection for requestor on B
+		ncReq := natsConnect(t, sb.ClientURL())
+		defer ncReq.Close()
+
+		// Setup sub for response manually
+		subReply := natsSubSync(t, ncReq, "bar")
+		// Wait for more than reqSubExp so that the reply subject
+		// is not mapped.
+		time.Sleep(100 * time.Millisecond)
+
+		// Send request
+		ncReq.PublishRequest("foo", "bar", []byte("request"))
+
+		// Responder should receive it.
+		m := natsNexMsg(t, respSub, time.Second)
+		// Check reply is not mapped...
+		if m.Reply != "bar" {
+			t.Fatalf("Expected reply to be \"bar\", got %q", m.Reply)
+		}
+		// Now send reply
+		m.Respond([]byte("reply"))
+
+		// Requestor's sub should receive it.
+		natsNexMsg(t, subReply, time.Second)
+	}
+	checkReqReply(t)
+
+	// Now restart server B...
+	sb.Shutdown()
+	sb = RunServer(ob)
+	defer sb.Shutdown()
+
+	// Again, set recent sub expiration to low value so we test
+	// when reply subject is not mapped.
+	setRecSubExp(sb)
+
+	// Check again...
+	checkReqReply(t)
 }

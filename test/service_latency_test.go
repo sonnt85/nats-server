@@ -381,13 +381,17 @@ func TestServiceLatencyWithNameMultiServer(t *testing.T) {
 
 	// Listen for metrics
 	rsub, _ := nc.SubscribeSync("results")
+	nc.Flush()
 
 	nc2 := clientConnect(t, sc.clusters[1].opts[1], "bar")
 	defer nc2.Close()
 	nc2.Request("ngs.usage", []byte("1h"), time.Second)
 
 	var sl server.ServiceLatency
-	rmsg, _ := rsub.NextMsg(time.Second)
+	rmsg, err := rsub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("Did not get response back: %v", err)
+	}
 	json.Unmarshal(rmsg.Data, &sl)
 
 	// Make sure we have AppName set.
