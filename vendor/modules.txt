@@ -1,4 +1,4 @@
-# github.com/nats-io/jwt v0.3.3-0.20191217183112-d4d149352589
+# github.com/nats-io/jwt v0.3.3-0.20200114180735-0b6d1dca75c1
 github.com/nats-io/jwt
 # github.com/nats-io/nats.go v1.9.1
 github.com/nats-io/nats.go

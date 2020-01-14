@@ -2,7 +2,7 @@ module github.com/nats-io/nats-server/v2
 
 require (
 	github.com/golang/protobuf v1.3.2 // indirect
-	github.com/nats-io/jwt v0.3.3-0.20200114142123-3206b44dc245
+	github.com/nats-io/jwt v0.3.3-0.20200114180735-0b6d1dca75c1
 	github.com/nats-io/nats.go v1.9.1
 	github.com/nats-io/nkeys v0.1.3
 	github.com/nats-io/nuid v1.0.1
