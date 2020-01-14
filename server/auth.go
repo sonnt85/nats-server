@@ -391,7 +391,6 @@ func (s *Server) processClientOrLeafAuthentication(c *client) bool {
 			}
 		}
 	}
-	allowBearerTokens := s.opts.AllowBearerTokens
 	s.mu.Unlock()
 
 	// If we have a jwt and a userClaim, make sure we have the Account, etc associated.
@@ -417,11 +416,8 @@ func (s *Server) processClientOrLeafAuthentication(c *client) bool {
 			c.Debugf("Account JWT has expired")
 			return false
 		}
-		if !allowBearerTokens && juc.BearerToken {
-			c.Debugf("Bearer tokens are not allowed")
-			return false
-		}
 		// skip validation of nonce when presented with a bearer token
+		// FIXME: if BearerToken is only for WSS, need check for server with that port enabled
 		if !juc.BearerToken {
 			// Verify the signature against the nonce.
 			if c.opts.Sig == "" {
