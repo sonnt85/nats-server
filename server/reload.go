@@ -594,6 +594,7 @@ func (s *Server) Reload() error {
 	clusterOrgPort := curOpts.Cluster.Port
 	gatewayOrgPort := curOpts.Gateway.Port
 	leafnodesOrgPort := curOpts.LeafNode.Port
+	websocketOrgPort := curOpts.Websocket.Port
 
 	s.mu.Unlock()
 
@@ -622,6 +623,9 @@ func (s *Server) Reload() error {
 	}
 	if newOpts.LeafNode.Port == -1 {
 		newOpts.LeafNode.Port = leafnodesOrgPort
+	}
+	if newOpts.Websocket.Port == -1 {
+		newOpts.Websocket.Port = websocketOrgPort
 	}
 
 	if err := s.reloadOptions(curOpts, newOpts); err != nil {
@@ -802,6 +806,18 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			// Similar to gateways
 			tmpOld := oldValue.(LeafNodeOpts)
 			tmpNew := newValue.(LeafNodeOpts)
+			tmpOld.TLSConfig = nil
+			tmpNew.TLSConfig = nil
+			// If there is really a change prevents reload.
+			if !reflect.DeepEqual(tmpOld, tmpNew) {
+				// See TODO(ik) note below about printing old/new values.
+				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
+					field.Name, oldValue, newValue)
+			}
+		case "websocket":
+			// Similar to gateways
+			tmpOld := oldValue.(WebsocketOpts)
+			tmpNew := newValue.(WebsocketOpts)
 			tmpOld.TLSConfig = nil
 			tmpNew.TLSConfig = nil
 			// If there is really a change prevents reload.

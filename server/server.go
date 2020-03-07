@@ -1,4 +1,4 @@
-// Copyright 2012-2019 The NATS Authors
+// Copyright 2012-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -203,6 +203,9 @@ type Server struct {
 		ch chan time.Duration
 		m  sync.Map
 	}
+
+	// Websocket structure
+	websocket srvWebsocket
 }
 
 // Make sure all are 64bits for atomic use
@@ -282,6 +285,10 @@ func NewServer(opts *Options) (*Server, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Capture option's compression level in the server object
+	// for faster access (needed in websocket clients when sending)
+	s.websocket.compressionLevel = opts.Websocket.CompressionLevel
 
 	// Ensure that non-exported options (used in tests) are properly set.
 	s.setLeafNodeNonExportedOptions()
@@ -412,7 +419,10 @@ func validateOptions(o *Options) error {
 	}
 	// Check that gateway is properly configured. Returns no error
 	// if there is no gateway defined.
-	return validateGatewayOptions(o)
+	if err := validateGatewayOptions(o); err != nil {
+		return err
+	}
+	return validateWebsocketOptions(o)
 }
 
 func (s *Server) getOpts() *Options {
@@ -1191,6 +1201,11 @@ func (s *Server) Start() {
 	// port to be opened and potential ephemeral port selected.
 	clientListenReady := make(chan struct{})
 
+	// Start websocket server if needed.
+	if opts.Websocket.Port != 0 {
+		s.startWebsocketServer()
+	}
+
 	// Start up routing as well if needed.
 	if opts.Cluster.Port != 0 {
 		s.startGoRoutine(func() {
@@ -1269,6 +1284,14 @@ func (s *Server) Shutdown() {
 		doneExpected++
 		s.listener.Close()
 		s.listener = nil
+	}
+
+	// Kick websocket server
+	if s.websocket.server != nil {
+		doneExpected++
+		s.websocket.server.Close()
+		s.websocket.server = nil
+		s.websocket.listener = nil
 	}
 
 	// Kick leafnodes AcceptLoop()
@@ -1423,7 +1446,7 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 		}
 		tmpDelay = ACCEPT_MIN_SLEEP
 		s.startGoRoutine(func() {
-			s.createClient(conn)
+			s.createClient(conn, 0)
 			s.grWG.Done()
 		})
 	}
@@ -1683,7 +1706,7 @@ func (s *Server) copyInfo() Info {
 	return info
 }
 
-func (s *Server) createClient(conn net.Conn) *client {
+func (s *Server) createClient(conn net.Conn, initalFlags clientFlag) *client {
 	// Snapshot server options.
 	opts := s.getOpts()
 
@@ -1695,7 +1718,8 @@ func (s *Server) createClient(conn net.Conn) *client {
 	}
 	now := time.Now()
 
-	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: maxPay, msubs: maxSubs, start: now, last: now}
+	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: maxPay, msubs: maxSubs, start: now, last: now, flags: initalFlags}
+	ws := c.flags.isSet(wsClient)
 
 	c.registerWithAccount(s.globalAccount())
 
@@ -1722,6 +1746,7 @@ func (s *Server) createClient(conn net.Conn) *client {
 	// TLS handshake is done (if applicable).
 	c.sendProtoNow(c.generateClientInfoJSON(info))
 
+	tlsRequired := !ws && info.TLSRequired
 	// Unlock to register
 	c.mu.Unlock()
 
@@ -1750,7 +1775,7 @@ func (s *Server) createClient(conn net.Conn) *client {
 	c.mu.Lock()
 
 	// Check for TLS
-	if info.TLSRequired {
+	if tlsRequired {
 		c.Debugf("Starting TLS client connection handshake")
 		c.nc = tls.Server(c.nc, opts.TLSConfig)
 		conn := c.nc.(*tls.Conn)
@@ -1801,7 +1826,7 @@ func (s *Server) createClient(conn net.Conn) *client {
 	// Spin up the write loop.
 	s.startGoRoutine(func() { c.writeLoop() })
 
-	if info.TLSRequired {
+	if tlsRequired {
 		c.Debugf("TLS handshake complete")
 		cs := c.nc.(*tls.Conn).ConnectionState()
 		c.Debugf("TLS version %s, cipher suite %s", tlsVersion(cs.Version), tlsCipher(cs.CipherSuite))
@@ -2122,7 +2147,11 @@ func (s *Server) ReadyForConnections(dur time.Duration) bool {
 	end := time.Now().Add(dur)
 	for time.Now().Before(end) {
 		s.mu.Lock()
-		ok := s.listener != nil && (opts.Cluster.Port == 0 || s.routeListener != nil) && (opts.Gateway.Name == "" || s.gatewayListener != nil)
+		ok := s.listener != nil &&
+			(opts.Cluster.Port == 0 || s.routeListener != nil) &&
+			(opts.Gateway.Name == "" || s.gatewayListener != nil) &&
+			(opts.LeafNode.Port == 0 || s.leafNodeListener != nil) &&
+			(opts.Websocket.Port == 0 || s.websocket.listener != nil)
 		s.mu.Unlock()
 		if ok {
 			return true
@@ -2292,6 +2321,7 @@ type Ports struct {
 	Monitoring []string `json:"monitoring,omitempty"`
 	Cluster    []string `json:"cluster,omitempty"`
 	Profile    []string `json:"profile,omitempty"`
+	WebSocket  []string `json:"websocket,omitempty"`
 }
 
 // PortsInfo attempts to resolve all the ports. If after maxWait the ports are not
@@ -2307,6 +2337,8 @@ func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
 		httpListener := s.http
 		clusterListener := s.routeListener
 		profileListener := s.profiler
+		wsListener := s.websocket.listener
+		wss := s.websocket.tls
 		s.mu.Unlock()
 
 		ports := Ports{}
@@ -2337,6 +2369,14 @@ func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
 
 		if profileListener != nil {
 			ports.Profile = formatURL("http", profileListener)
+		}
+
+		if wsListener != nil {
+			protocol := "ws"
+			if wss {
+				protocol = "wss"
+			}
+			ports.WebSocket = formatURL(protocol, wsListener)
 		}
 
 		return &ports
@@ -2441,6 +2481,9 @@ func (s *Server) serviceListeners() []net.Listener {
 	}
 	if opts.ProfPort != 0 {
 		listeners = append(listeners, s.profiler)
+	}
+	if opts.Websocket.Port != 0 {
+		listeners = append(listeners, s.websocket.listener)
 	}
 	return listeners
 }

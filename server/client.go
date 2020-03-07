@@ -108,6 +108,14 @@ const (
 	writeLoopStarted                         // Marks that the writeLoop has been started.
 	skipFlushOnClose                         // Marks that flushOutbound() should not be called on connection close.
 	expectConnect                            // Marks if this connection is expected to send a CONNECT
+
+	// We will get rid of these flags if we decide to move the ws framing from
+	// "enqueueing" to "flushOutbound", which then would require to maintain state
+	// about partials, so would likely have a *client.websocket structure that would
+	// at the same time hold this information.
+	wsClient       // Marks that this is a websocket client
+	wsCompress     // Marks that compression has been negotiated with this client
+	wsCloseMsgSent // Marks that the CloseMessage has been sent to this websocket client
 )
 
 // set the flag (would be equivalent to set the boolean to true)
@@ -471,11 +479,14 @@ func (c *client) initClient() {
 
 	// snapshot the string version of the connection
 	var conn string
-	if ip, ok := c.nc.(*net.TCPConn); ok {
-		conn = ip.RemoteAddr().String()
-		host, port, _ := net.SplitHostPort(conn)
-		iPort, _ := strconv.Atoi(port)
-		c.host, c.port = host, uint16(iPort)
+	if c.nc != nil {
+		if addr := c.nc.RemoteAddr(); addr != nil {
+			if conn = addr.String(); conn != _EMPTY_ {
+				host, port, _ := net.SplitHostPort(conn)
+				iPort, _ := strconv.Atoi(port)
+				c.host, c.port = host, uint16(iPort)
+			}
+		}
 	}
 
 	switch c.kind {
@@ -855,6 +866,7 @@ func (c *client) readLoop() {
 		return
 	}
 	nc := c.nc
+	ws := c.flags.isSet(wsClient)
 	c.in.rsz = startBufSize
 	// Snapshot max control line since currently can not be changed on reload and we
 	// were checking it on each call to parse. If this changes and we allow MaxControlLine
@@ -880,12 +892,31 @@ func (c *client) readLoop() {
 	// Start read buffer.
 	b := make([]byte, c.in.rsz)
 
+	var _bufs [1][]byte
+	bufs := _bufs[:1]
+
+	var wsr *wsReadInfo
+	if ws {
+		wsr = &wsReadInfo{}
+		wsr.init()
+	}
+
 	for {
 		n, err := nc.Read(b)
 		// If we have any data we will try to parse and exit at the end.
 		if n == 0 && err != nil {
 			c.closeConnection(closedStateForErr(err))
 			return
+		}
+		if ws {
+			bufs, err = c.wsRead(wsr, nc, b[:n])
+			if bufs == nil && err != nil {
+				c.closeConnection(closedStateForErr(err))
+			} else if bufs == nil {
+				continue
+			}
+		} else {
+			bufs[0] = b[:n]
 		}
 		start := time.Now()
 
@@ -896,20 +927,22 @@ func (c *client) readLoop() {
 
 		// Main call into parser for inbound data. This will generate callouts
 		// to process messages, etc.
-		if err := c.parse(b[:n]); err != nil {
-			if dur := time.Since(start); dur >= readLoopReportThreshold {
-				c.Warnf("Readloop processing time: %v", dur)
+		for i := 0; i < len(bufs); i++ {
+			if err := c.parse(bufs[i]); err != nil {
+				if dur := time.Since(start); dur >= readLoopReportThreshold {
+					c.Warnf("Readloop processing time: %v", dur)
+				}
+				// Need to call flushClients because some of the clients have been
+				// assigned messages and their "fsp" incremented, and need now to be
+				// decremented and their writeLoop signaled.
+				c.flushClients(0)
+				// handled inline
+				if err != ErrMaxPayload && err != ErrAuthentication {
+					c.Error(err)
+					c.closeConnection(ProtocolViolation)
+				}
+				return
 			}
-			// Need to call flushClients because some of the clients have been
-			// assigned messages and their "fsp" incremented, and need now to be
-			// decremented and their writeLoop signaled.
-			c.flushClients(0)
-			// handled inline
-			if err != ErrMaxPayload && err != ErrAuthentication {
-				c.Error(err)
-				c.closeConnection(ProtocolViolation)
-			}
-			return
 		}
 
 		// Updates stats for client and server that were collected
@@ -1195,6 +1228,8 @@ func (c *client) markConnAsClosed(reason ClosedState, skipFlush bool) bool {
 	c.flags.set(closeConnection)
 	if skipFlush {
 		c.flags.set(skipFlushOnClose)
+	} else if c.flags.isSet(wsClient) && !c.flags.isSet(wsCloseMsgSent) {
+		c.wsEnqueueCloseMessage(reason)
 	}
 	// Save off the connection if its a client or leafnode.
 	if c.kind == CLIENT || c.kind == LEAF {
@@ -1641,6 +1676,22 @@ func (c *client) queueOutbound(data []byte) bool {
 func (c *client) enqueueProtoAndFlush(proto []byte, doFlush bool) {
 	if c.isClosed() {
 		return
+	}
+	if c.flags.isSet(wsClient) {
+		// TODO: framing each proto degrades performance when compression
+		// is in used, I think. It may be more efficient to frame/compress
+		// in flushOutbound when aggregating buffers and ready to write.
+		// However, because of compression, it would be difficult to handle
+		// partial writes. Also, when there is a need to send WS control
+		// messages, these need to be framed separately.
+		var wsfh []byte
+		cl := defaultCompressionLevel
+		if c.srv != nil {
+			cl = c.srv.websocket.compressionLevel
+		}
+		wsfh, proto = wsCreateFrameAndPayload(wsBinaryMessage,
+			c.flags.isSet(wsCompress), cl, proto)
+		c.queueOutbound(wsfh)
 	}
 	c.queueOutbound(proto)
 	if !(doFlush && c.flushOutbound()) {
@@ -2523,8 +2574,18 @@ func (c *client) deliverMsg(sub *subscription, subject, mh, msg []byte, gwrply b
 	}
 
 	// Queue to outbound buffer
-	client.queueOutbound(mh)
-	client.queueOutbound(msg)
+	if client.flags.isSet(wsClient) {
+		// For WS client, need to call enqueueProto() with complete protocol.
+		// The call enqueueProto() will correctly WS frame and possibly
+		// compress the payload.
+		completeProto := make([]byte, len(mh)+len(msg))
+		copy(completeProto, mh)
+		copy(completeProto[len(mh):], msg)
+		client.enqueueProto(completeProto)
+	} else {
+		client.queueOutbound(mh)
+		client.queueOutbound(msg)
+	}
 
 	client.out.pm++
 
