@@ -1904,6 +1904,37 @@ func TestWSServerReportUpgradeFailure(t *testing.T) {
 	}
 }
 
+func TestWSCloseMsgSendOnConnectionClose(t *testing.T) {
+	o := testWSOptions()
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	wsc, br := testWSCreateClient(t, false, o.Websocket.Host, o.Websocket.Port)
+	defer wsc.Close()
+
+	checkClientsCount(t, s, 1)
+	var c *client
+	s.mu.Lock()
+	for _, cli := range s.clients {
+		c = cli
+		break
+	}
+	s.mu.Unlock()
+
+	c.closeConnection(ProtocolViolation)
+	msg := testWSReadFrame(t, br)
+	if len(msg) < 2 {
+		t.Fatalf("Should have 2 bytes to represent the status, got %v", msg)
+	}
+	if sc := int(binary.BigEndian.Uint16(msg[:2])); sc != wsCloseStatusProtocolError {
+		t.Fatalf("Expected status to be %v, got %v", wsCloseStatusProtocolError, sc)
+	}
+	expectedPayload := ProtocolViolation.String()
+	if p := string(msg[2:]); p != expectedPayload {
+		t.Fatalf("Expected payload to be %q, got %q", expectedPayload, p)
+	}
+}
+
 // ==================================================================
 // = Benchmark tests
 // ==================================================================

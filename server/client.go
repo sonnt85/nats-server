@@ -491,7 +491,11 @@ func (c *client) initClient() {
 
 	switch c.kind {
 	case CLIENT:
-		c.ncs = fmt.Sprintf("%s - cid:%d", conn, c.cid)
+		name := "cid"
+		if c.flags.isSet(wsClient) {
+			name = "wid"
+		}
+		c.ncs = fmt.Sprintf("%s - %s:%d", conn, name, c.cid)
 	case ROUTER:
 		c.ncs = fmt.Sprintf("%s - rid:%d", conn, c.cid)
 	case GATEWAY:
@@ -1225,12 +1229,14 @@ func (c *client) markConnAsClosed(reason ClosedState, skipFlush bool) bool {
 	if c.flags.isSet(closeConnection) {
 		return false
 	}
-	c.flags.set(closeConnection)
 	if skipFlush {
 		c.flags.set(skipFlushOnClose)
 	} else if c.flags.isSet(wsClient) && !c.flags.isSet(wsCloseMsgSent) {
 		c.wsEnqueueCloseMessage(reason)
 	}
+	// Do not set until after possibly calling wsEnqueueCloseMessage()
+	// otherwise queueOutbound() would be a no-op.
+	c.flags.set(closeConnection)
 	// Save off the connection if its a client or leafnode.
 	if c.kind == CLIENT || c.kind == LEAF {
 		if nc := c.nc; nc != nil && c.srv != nil {

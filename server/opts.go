@@ -845,7 +845,7 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 		o.ConnectErrorReports = int(v.(int64))
 	case "reconnect_error_reports":
 		o.ReconnectErrorReports = int(v.(int64))
-	case "websocket":
+	case "websocket", "ws":
 		if err := parseWebsocket(tk, o, errors, warnings); err != nil {
 			*errors = append(*errors, err)
 			return
@@ -2789,13 +2789,6 @@ func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]erro
 				err := &configErr{tk, fmt.Sprintf("error parsing allowed origins: unsupported type %T", mv)}
 				*errors = append(*errors, err)
 			}
-			// Disable compression for now...
-			/*
-				case "compression":
-					o.Websocket.Compression = mv.(bool)
-				case "compression_level":
-					o.Websocket.CompressionLevel = int(mv.(int64))
-			*/
 		case "handshake_timeout":
 			ht := time.Duration(0)
 			switch mv := mv.(type) {
