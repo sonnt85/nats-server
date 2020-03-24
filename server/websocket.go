@@ -706,7 +706,7 @@ func validateWebsocketOptions(o *Options) error {
 	if wo.Port == 0 {
 		return nil
 	}
-	// Enfore TLS...
+	// Enforce TLS...
 	if wo.TLSConfig == nil {
 		return errors.New("websocket requires TLS configuration")
 	}

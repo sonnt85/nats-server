@@ -896,6 +896,10 @@ func (c *client) readLoop() {
 	// Start read buffer.
 	b := make([]byte, c.in.rsz)
 
+	// Websocket clients will return several slices if there are multiple
+	// websocket frames in the blind read. For non WS clients though, we
+	// will always have 1 slice per loop iteration. So we define this here
+	// so non WS clients will use bufs[0] = b[:n].
 	var _bufs [1][]byte
 	bufs := _bufs[:1]
 
