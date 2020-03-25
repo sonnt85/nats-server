@@ -1773,6 +1773,10 @@ func (c *client) generateClientInfoJSON(info Info) []byte {
 	info.CID = c.cid
 	info.ClientIP = c.host
 	info.MaxPayload = c.mpay
+	if c.flags.isSet(wsClient) {
+		info.ClientConnectURLs = info.WSConnectURLs
+	}
+	info.WSConnectURLs = nil
 	// Generate the info json
 	b, _ := json.Marshal(info)
 	pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
@@ -3598,6 +3602,7 @@ func (c *client) teardownConn() {
 	var (
 		retryImplicit bool
 		connectURLs   []string
+		wsConnectURLs []string
 		gwName        string
 		gwIsOutbound  bool
 		gwCfg         *gatewayCfg
@@ -3627,6 +3632,7 @@ func (c *client) teardownConn() {
 			retryImplicit = c.route.retry
 		}
 		connectURLs = c.route.connectURLs
+		wsConnectURLs = c.route.wsConnURLs
 	}
 	if kind == GATEWAY {
 		gwName = c.gw.name
@@ -3645,11 +3651,11 @@ func (c *client) teardownConn() {
 
 	if srv != nil {
 		// This is a route that disconnected, but we are not in lame duck mode...
-		if len(connectURLs) > 0 && !srv.isLameDuckMode() {
+		if (len(connectURLs) > 0 || len(wsConnectURLs) > 0) && !srv.isLameDuckMode() {
 			// Unless disabled, possibly update the server's INFO protocol
 			// and send to clients that know how to handle async INFOs.
 			if !srv.getOpts().Cluster.NoAdvertise {
-				srv.removeClientConnectURLsAndSendINFOToClients(connectURLs)
+				srv.removeConnectURLsAndSendINFOToClients(connectURLs, wsConnectURLs)
 			}
 		}
 

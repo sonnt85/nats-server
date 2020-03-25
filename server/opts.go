@@ -240,6 +240,8 @@ type WebsocketOpts struct {
 	Host string
 	// The server will accept websocket client connections on this port.
 	Port int
+	// The host:port to advertise to websocket clients in the cluster.
+	Advertise string
 
 	// TLS configuration is required.
 	TLSConfig *tls.Config
@@ -2759,6 +2761,8 @@ func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]erro
 			o.Websocket.Port = int(mv.(int64))
 		case "host", "net":
 			o.Websocket.Host = mv.(string)
+		case "advertise":
+			o.Websocket.Advertise = mv.(string)
 		case "tls":
 			config, _, err := getTLSConfig(tk)
 			if err != nil {

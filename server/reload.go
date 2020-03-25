@@ -295,8 +295,10 @@ func (c *clusterOption) Apply(server *Server) {
 	server.routeInfo.AuthRequired = c.newValue.Username != ""
 	if c.newValue.NoAdvertise {
 		server.routeInfo.ClientConnectURLs = nil
+		server.routeInfo.WSConnectURLs = nil
 	} else {
 		server.routeInfo.ClientConnectURLs = server.clientConnectURLs
+		server.routeInfo.WSConnectURLs = server.websocket.connectURLs
 	}
 	server.setRouteInfoHostPortAndIP()
 	server.mu.Unlock()
@@ -512,7 +514,7 @@ type clientAdvertiseOption struct {
 // Apply the setting by updating the server info and regenerate the infoJSON byte array.
 func (c *clientAdvertiseOption) Apply(server *Server) {
 	server.mu.Lock()
-	server.setInfoHostPortAndGenerateJSON()
+	server.setInfoHostPort()
 	server.mu.Unlock()
 	server.Noticef("Reload: client_advertise = %s", c.newValue)
 }

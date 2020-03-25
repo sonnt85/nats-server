@@ -19,6 +19,7 @@ import (
 	"compress/flate"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1372,6 +1373,7 @@ func TestWSParseOptions(t *testing.T) {
 		{"bad listen", "websocket: { listen: [] }", nil, "port or host:port"},
 		{"bad port", `websocket: { port: "abc" }`, nil, "not int64"},
 		{"bad host", `websocket: { host: 123 }`, nil, "not string"},
+		{"bad advertise type", `websocket: { advertise: 123 }`, nil, "not string"},
 		{"bad tls", `websocket: { tls: 123 }`, nil, "not map[string]interface {}"},
 		{"bad same origin", `websocket: { same_origin: "abc" }`, nil, "not bool"},
 		{"bad allowed origins type", `websocket: { allowed_origins: {} }`, nil, "unsupported type"},
@@ -1401,6 +1403,12 @@ func TestWSParseOptions(t *testing.T) {
 		{"port", `websocket { port: 1234 }`, func(wo *WebsocketOpts) error {
 			if wo.Port != 1234 {
 				return fmt.Errorf("expected 1234, got %v", wo.Port)
+			}
+			return nil
+		}, ""},
+		{"advertise", `websocket { advertise: "host:1234" }`, func(wo *WebsocketOpts) error {
+			if wo.Advertise != "host:1234" {
+				return fmt.Errorf("expected %q, got %q", "host:1234", wo.Advertise)
 			}
 			return nil
 		}, ""},
@@ -1638,10 +1646,14 @@ func testWSCreateClient(t testing.TB, compress bool, host string, port int) (net
 	if msg := testWSReadFrame(t, br); !bytes.HasPrefix(msg, []byte("INFO {")) {
 		t.Fatalf("Expected INFO, got %s", msg)
 	}
-	// Send CONNECT
-	wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, compress, []byte("CONNECT {\"verbose\":false}\r\n"))
+	// Send CONNECT and PING
+	wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, compress, []byte("CONNECT {\"verbose\":false,\"protocol\":1}\r\nPING\r\n"))
 	if _, err := wsc.Write(wsmsg); err != nil {
 		t.Fatalf("Error sending message: %v", err)
+	}
+	// Wait for the PONG
+	if msg := testWSReadFrame(t, br); !bytes.HasPrefix(msg, []byte("PONG\r\n")) {
+		t.Fatalf("Expected INFO, got %s", msg)
 	}
 	return wsc, br
 }
@@ -1933,6 +1945,76 @@ func TestWSCloseMsgSendOnConnectionClose(t *testing.T) {
 	if p := string(msg[2:]); p != expectedPayload {
 		t.Fatalf("Expected payload to be %q, got %q", expectedPayload, p)
 	}
+}
+
+func TestWSAdvertise(t *testing.T) {
+	o := testWSOptions()
+	o.Cluster.Port = 0
+	o.HTTPPort = 0
+	o.Websocket.Advertise = "xxx:host:yyy"
+	s, err := NewServer(o)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer s.Shutdown()
+	l := &captureFatalLogger{fatalCh: make(chan string, 1)}
+	s.SetLogger(l, false, false)
+	go s.Start()
+	select {
+	case e := <-l.fatalCh:
+		if !strings.Contains(e, "Unable to get websocket connect URLs") {
+			t.Fatalf("Unexpected error: %q", e)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Should have failed to start")
+	}
+	s.Shutdown()
+
+	o1 := testWSOptions()
+	o1.Websocket.Advertise = "host1:1234"
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	wsc, br := testWSCreateClient(t, false, o1.Websocket.Host, o1.Websocket.Port)
+	defer wsc.Close()
+
+	o2 := testWSOptions()
+	o2.Websocket.Advertise = "host2:5678"
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", o1.Cluster.Host, o1.Cluster.Port))
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	checkInfo := func(expected []string) {
+		t.Helper()
+		infob := testWSReadFrame(t, br)
+		info := &Info{}
+		json.Unmarshal(infob[5:], info)
+		if n := len(info.ClientConnectURLs); n != len(expected) {
+			t.Fatalf("Unexpected info: %+v", info)
+		}
+		good := 0
+		for _, u := range info.ClientConnectURLs {
+			for _, eu := range expected {
+				if u == eu {
+					good++
+				}
+			}
+		}
+		if good != len(expected) {
+			t.Fatalf("Unexpected connect urls: %q", info.ClientConnectURLs)
+		}
+	}
+	checkInfo([]string{"host1:1234", "host2:5678"})
+
+	// Now shutdown s2 and expect another INFO
+	s2.Shutdown()
+	checkInfo([]string{"host1:1234"})
+
+	// Restart with another advertise and check that it gets updated
+	o2.Websocket.Advertise = "host3:9012"
+	s2 = RunServer(o2)
+	defer s2.Shutdown()
+	checkInfo([]string{"host1:1234", "host3:9012"})
 }
 
 // ==================================================================

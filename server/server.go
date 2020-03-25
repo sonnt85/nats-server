@@ -75,7 +75,8 @@ type Info struct {
 	ClientIP          string   `json:"client_ip,omitempty"`
 	Nonce             string   `json:"nonce,omitempty"`
 	Cluster           string   `json:"cluster,omitempty"`
-	ClientConnectURLs []string `json:"connect_urls,omitempty"` // Contains URLs a client can connect to.
+	ClientConnectURLs []string `json:"connect_urls,omitempty"`    // Contains URLs a client can connect to.
+	WSConnectURLs     []string `json:"ws_connect_urls,omitempty"` // Contains URLs a ws client can connect to.
 
 	// Route Specific
 	Import *SubjectPermission `json:"import,omitempty"`
@@ -289,6 +290,8 @@ func NewServer(opts *Options) (*Server, error) {
 	// Capture option's compression level in the server object
 	// for faster access (needed in websocket clients when sending)
 	s.websocket.compressionLevel = opts.Websocket.CompressionLevel
+	// Used internally for quick look-ups.
+	s.websocket.connectURLsMap = make(map[string]struct{})
 
 	// Ensure that non-exported options (used in tests) are properly set.
 	s.setLeafNodeNonExportedOptions()
@@ -311,7 +314,7 @@ func NewServer(opts *Options) (*Server, error) {
 	// listener has been created (possibly with random port),
 	// but since some tests may expect the INFO to be properly
 	// set after New(), let's do it now.
-	s.setInfoHostPortAndGenerateJSON()
+	s.setInfoHostPort()
 
 	// For tracking clients
 	s.clients = make(map[uint64]*client)
@@ -1201,7 +1204,9 @@ func (s *Server) Start() {
 	// port to be opened and potential ephemeral port selected.
 	clientListenReady := make(chan struct{})
 
-	// Start websocket server if needed.
+	// Start websocket server if needed. Do this before starting the routes,
+	// because we want to resolve the gateway host:port so that this information
+	// can be sent to other routes.
 	if opts.Websocket.Port != 0 {
 		s.startWebsocketServer()
 	}
@@ -1404,7 +1409,6 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 
 	// Setup state that can enable shutdown
 	s.mu.Lock()
-	s.listener = l
 
 	// If server was started with RANDOM_PORT (-1), opts.Port would be equal
 	// to 0 at the beginning this function. So we need to get the actual port
@@ -1415,14 +1419,16 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 
 	// Now that port has been set (if it was set to RANDOM), set the
 	// server's info Host/Port with either values from Options or
-	// ClientAdvertise. Also generate the JSON byte array.
-	if err := s.setInfoHostPortAndGenerateJSON(); err != nil {
+	// ClientAdvertise.
+	if err := s.setInfoHostPort(); err != nil {
 		s.Fatalf("Error setting server INFO with ClientAdvertise value of %s, err=%v", s.opts.ClientAdvertise, err)
+		l.Close()
 		s.mu.Unlock()
 		return
 	}
 	// Keep track of client connect URLs. We may need them later.
 	s.clientConnectURLs = s.getClientConnectURLs()
+	s.listener = l
 	s.mu.Unlock()
 
 	// Let the caller know that we are ready
@@ -1457,8 +1463,7 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 // Note that this function may be called during config reload, this is why
 // Host/Port may be reset to original Options if the ClientAdvertise option
 // is not set (since it may have previously been).
-// The function then generates the server infoJSON.
-func (s *Server) setInfoHostPortAndGenerateJSON() error {
+func (s *Server) setInfoHostPort() error {
 	// When this function is called, opts.Port is set to the actual listen
 	// port (if option was originally set to RANDOM), even during a config
 	// reload. So use of s.opts.Port is safe.
@@ -1687,14 +1692,16 @@ func (s *Server) HTTPHandler() http.Handler {
 	return s.httpHandler
 }
 
-// Perform a conditional deep copy due to reference nature of ClientConnectURLs.
+// Perform a conditional deep copy due to reference nature of [Client|WS]ConnectURLs.
 // If updates are made to Info, this function should be consulted and updated.
 // Assume lock is held.
 func (s *Server) copyInfo() Info {
 	info := s.info
-	if info.ClientConnectURLs != nil {
-		info.ClientConnectURLs = make([]string, len(s.info.ClientConnectURLs))
-		copy(info.ClientConnectURLs, s.info.ClientConnectURLs)
+	if len(info.ClientConnectURLs) > 0 {
+		info.ClientConnectURLs = append([]string(nil), s.info.ClientConnectURLs...)
+	}
+	if len(info.WSConnectURLs) > 0 {
+		info.WSConnectURLs = append([]string(nil), s.info.WSConnectURLs...)
 	}
 	if s.nonceRequired() {
 		// Nonce handling
@@ -1874,57 +1881,66 @@ func (s *Server) saveClosedClient(c *client, nc net.Conn, reason ClosedState) {
 	s.mu.Unlock()
 }
 
-// Adds the given array of urls to the server's INFO.ClientConnectURLs
-// array. The server INFO JSON is regenerated.
-// Note that a check is made to ensure that given URLs are not
-// already present. So the INFO JSON is regenerated only if new ULRs
-// were added.
+// Adds to the list of client and websocket clients connect URLs.
 // If there was a change, an INFO protocol is sent to registered clients
 // that support async INFO protocols.
-func (s *Server) addClientConnectURLsAndSendINFOToClients(urls []string) {
-	s.updateServerINFOAndSendINFOToClients(urls, true)
+func (s *Server) addConnectURLsAndSendINFOToClients(curls, wsurls []string) {
+	s.updateServerINFOAndSendINFOToClients(curls, wsurls, true)
 }
 
-// Removes the given array of urls from the server's INFO.ClientConnectURLs
-// array. The server INFO JSON is regenerated if needed.
+// Removes from the list of client and websocket clients connect URLs.
 // If there was a change, an INFO protocol is sent to registered clients
 // that support async INFO protocols.
-func (s *Server) removeClientConnectURLsAndSendINFOToClients(urls []string) {
-	s.updateServerINFOAndSendINFOToClients(urls, false)
+func (s *Server) removeConnectURLsAndSendINFOToClients(curls, wsurls []string) {
+	s.updateServerINFOAndSendINFOToClients(curls, wsurls, false)
 }
 
-// Updates the server's Info object with the given array of URLs and re-generate
-// the infoJSON byte array, then send an (async) INFO protocol to clients that
-// support it.
-func (s *Server) updateServerINFOAndSendINFOToClients(urls []string, add bool) {
+// Updates the list of client and websocket clients connect URLs and if any change
+// sends an async INFO update to clients that support it.
+func (s *Server) updateServerINFOAndSendINFOToClients(curls, wsurls []string, add bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// Will be set to true if we alter the server's Info object.
-	wasUpdated := false
 	remove := !add
-	for _, url := range urls {
-		_, present := s.clientConnectURLsMap[url]
-		if add && !present {
-			s.clientConnectURLsMap[url] = struct{}{}
-			wasUpdated = true
-		} else if remove && present {
-			delete(s.clientConnectURLsMap, url)
-			wasUpdated = true
+	checkMap := func(urls []string, m map[string]struct{}) bool {
+		wasUpdated := false
+		for _, url := range urls {
+			_, present := m[url]
+			if add && !present {
+				m[url] = struct{}{}
+				wasUpdated = true
+			} else if remove && present {
+				delete(m, url)
+				wasUpdated = true
+			}
+		}
+		return wasUpdated
+	}
+	cliUpdated := checkMap(curls, s.clientConnectURLsMap)
+	wsUpdated := checkMap(wsurls, s.websocket.connectURLsMap)
+
+	updateInfo := func(infoURLs *[]string, urls []string, m map[string]struct{}) {
+		// Recreate the info's slice from the map
+		*infoURLs = (*infoURLs)[:0]
+		// Add this server client connect ULRs first...
+		*infoURLs = append(*infoURLs, urls...)
+		// Then the ones from the map
+		for url := range m {
+			*infoURLs = append(*infoURLs, url)
 		}
 	}
-	if wasUpdated {
-		// Recreate the info.ClientConnectURL array from the map
-		s.info.ClientConnectURLs = s.info.ClientConnectURLs[:0]
-		// Add this server client connect ULRs first...
-		s.info.ClientConnectURLs = append(s.info.ClientConnectURLs, s.clientConnectURLs...)
-		for url := range s.clientConnectURLsMap {
-			s.info.ClientConnectURLs = append(s.info.ClientConnectURLs, url)
-		}
+	if cliUpdated {
+		updateInfo(&s.info.ClientConnectURLs, s.clientConnectURLs, s.clientConnectURLsMap)
+	}
+	if wsUpdated {
+		updateInfo(&s.info.WSConnectURLs, s.websocket.connectURLs, s.websocket.connectURLsMap)
+	}
+	if cliUpdated || wsUpdated {
 		// Update the time of this update
 		s.lastCURLsUpdate = time.Now().UnixNano()
 		// Send to all registered clients that support async INFO protocols.
-		s.sendAsyncInfoToClients()
+		s.sendAsyncInfoToClients(cliUpdated, wsUpdated)
 	}
 }
 
@@ -2203,16 +2219,28 @@ func (s *Server) closedClients() []*closedClient {
 func (s *Server) getClientConnectURLs() []string {
 	// Snapshot server options.
 	opts := s.getOpts()
+	// Ignore error here since we know that if there is client advertise, the
+	// parseHostPort is correct because we did it right before calling this
+	// function in Server.New().
+	urls, _ := s.getConnectURLs(opts.ClientAdvertise, opts.Host, opts.Port)
+	return urls
+}
 
+// Generic version that will return an array of URLs based on the given
+// advertise, host and port values.
+func (s *Server) getConnectURLs(advertise, host string, port int) ([]string, error) {
 	urls := make([]string, 0, 1)
 
-	// short circuit if client advertise is set
-	if opts.ClientAdvertise != "" {
-		// just use the info host/port. This is updated in s.New()
-		urls = append(urls, net.JoinHostPort(s.info.Host, strconv.Itoa(s.info.Port)))
+	// short circuit if advertise is set
+	if advertise != "" {
+		h, p, err := parseHostPort(advertise, port)
+		if err != nil {
+			return nil, err
+		}
+		urls = append(urls, net.JoinHostPort(h, strconv.Itoa(p)))
 	} else {
-		sPort := strconv.Itoa(opts.Port)
-		_, ips, err := s.getNonLocalIPsIfHostIsIPAny(opts.Host, true)
+		sPort := strconv.Itoa(port)
+		_, ips, err := s.getNonLocalIPsIfHostIsIPAny(host, true)
 		for _, ip := range ips {
 			urls = append(urls, net.JoinHostPort(ip, sPort))
 		}
@@ -2223,14 +2251,14 @@ func (s *Server) getClientConnectURLs() []string {
 			// and not add any address in the array in the loop above, and we
 			// ended-up returning 0.0.0.0, which is problematic for Windows clients.
 			// Check for 0.0.0.0 or :: specifically, and ignore if that's the case.
-			if opts.Host == "0.0.0.0" || opts.Host == "::" {
-				s.Errorf("Address %q can not be resolved properly", opts.Host)
+			if host == "0.0.0.0" || host == "::" {
+				s.Errorf("Address %q can not be resolved properly", host)
 			} else {
-				urls = append(urls, net.JoinHostPort(opts.Host, sPort))
+				urls = append(urls, net.JoinHostPort(host, sPort))
 			}
 		}
 	}
-	return urls
+	return urls, nil
 }
 
 // Returns an array of non local IPs if the provided host is
@@ -2332,7 +2360,7 @@ func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
 		opts := s.getOpts()
 
 		s.mu.Lock()
-		info := s.copyInfo()
+		tls := s.info.TLSRequired
 		listener := s.listener
 		httpListener := s.http
 		clusterListener := s.routeListener
@@ -2345,7 +2373,7 @@ func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
 
 		if listener != nil {
 			natsProto := "nats"
-			if info.TLSRequired {
+			if tls {
 				natsProto = "tls"
 			}
 			ports.Nats = formatURL(natsProto, listener)

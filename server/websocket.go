@@ -91,6 +91,8 @@ type srvWebsocket struct {
 	compressionLevel int
 	allowedOrigins   map[string]*allowedOrigin // host will be the key
 	sameOrigin       bool
+	connectURLs      []string
+	connectURLsMap   map[string]struct{}
 }
 
 type allowedOrigin struct {
@@ -808,12 +810,19 @@ func (s *Server) startWebsocketServer() {
 		ErrorLog:    log.New(&wsCaptureHTTPServerLog{s}, "", 0),
 	}
 	s.mu.Lock()
-	s.websocket.server = hs
-	s.websocket.listener = hl
 	s.websocket.tls = proto == "wss"
 	if port == 0 {
 		s.opts.Websocket.Port = hl.Addr().(*net.TCPAddr).Port
 	}
+	s.websocket.connectURLs, err = s.getConnectURLs(o.Advertise, o.Host, o.Port)
+	if err != nil {
+		s.Fatalf("Unable to get websocket connect URLs: %v", err)
+		hs.Close()
+		s.mu.Unlock()
+		return
+	}
+	s.websocket.server = hs
+	s.websocket.listener = hl
 	s.mu.Unlock()
 
 	s.startGoRoutine(func() {
