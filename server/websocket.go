@@ -53,7 +53,9 @@ const (
 	wsMaskBit = 1 << 7
 
 	wsContinuationFrame     = 0
+	wsMaxFrameHeaderSize    = 10 // For a server-to-client frame
 	wsMaxControlPayloadSize = 125
+	wsFrameSizeForBrowsers  = 4096 // From experiment, webrowsers behave better with limited frame size
 
 	// From https://tools.ietf.org/html/rfc6455#section-11.7
 	wsCloseStatusNormalClosure      = 1000
@@ -83,6 +85,15 @@ var (
 // From https://tools.ietf.org/html/rfc6455#section-1.3
 var wsGUID = []byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
+type websocket struct {
+	frames    net.Buffers
+	fs        int64
+	closeMsg  []byte
+	closeSent bool
+	compress  bool
+	browser   bool
+}
+
 type srvWebsocket struct {
 	mu               sync.RWMutex
 	server           *http.Server
@@ -101,8 +112,8 @@ type allowedOrigin struct {
 }
 
 type wsUpgradeResult struct {
-	conn     net.Conn
-	compress bool
+	conn net.Conn
+	ws   *websocket
 }
 
 type wsReadInfo struct {
@@ -382,37 +393,40 @@ func wsCreateFrameAndPayload(frameType wsOpCode, compress bool, cl int, payload 
 		rawBytes := buf.Bytes()
 		payload = rawBytes[:len(rawBytes)-4]
 	}
-	return wsFrameMessage(compress, frameType, len(payload)), payload
+	return wsCreateFrameHeader(compress, frameType, len(payload)), payload
 }
 
 // Create the frame header.
 // Encodes the frame type and optional compression flag, and the size of the payload.
-func wsFrameMessage(compressed bool, frameType wsOpCode, l int) []byte {
-	// websocket frame header
-	var fh []byte
+func wsCreateFrameHeader(compressed bool, frameType wsOpCode, l int) []byte {
+	fh := make([]byte, wsMaxFrameHeaderSize)
+	n := wsFillFrameHeader(fh, compressed, frameType, l)
+	return fh[:n]
+}
 
+func wsFillFrameHeader(fh []byte, compressed bool, frameType wsOpCode, l int) int {
+	var n int
 	b := byte(frameType | wsFinalBit)
 	if compressed {
 		b |= wsRsv1Bit
 	}
-
 	switch {
 	case l <= 125:
-		fh = make([]byte, 2)
+		n = 2
 		fh[0] = b
 		fh[1] = byte(l)
 	case l < 65536:
-		fh = make([]byte, 2+2)
+		n = 4
 		fh[0] = b
 		fh[1] = 126
 		binary.BigEndian.PutUint16(fh[2:], uint16(l))
 	default:
-		fh = make([]byte, 2+8)
+		n = 10
 		fh[0] = b
 		fh[1] = 127
 		binary.BigEndian.PutUint64(fh[2:], uint64(l))
 	}
-	return fh
+	return n
 }
 
 // Invokes wsEnqueueControlMessageLocked under client lock.
@@ -431,16 +445,27 @@ func (c *client) wsEnqueueControlMessage(controlMsg wsOpCode, payload []byte) {
 //
 // Client lock held on entry.
 func (c *client) wsEnqueueControlMessageLocked(controlMsg wsOpCode, payload []byte) {
-	// Control messages are never compressed.
-	h := wsFrameMessage(false, controlMsg, len(payload))
-	c.queueOutbound(h)
+	// Control messages are never compressed and their size will be
+	// less than wsMaxControlPayloadSize, which means the frame header
+	// will be only 2 bytes.
+	cm := make([]byte, 2+len(payload))
+	wsFillFrameHeader(cm, false, controlMsg, len(payload))
 	// Note that payload is optional.
 	if len(payload) > 0 {
-		c.queueOutbound(payload)
+		copy(cm[2:], payload)
 	}
+	c.out.pb += int64(len(cm))
 	if controlMsg == wsCloseMessage {
-		c.flags.set(wsCloseMsgSent)
+		// We can't add the close message to the frames buffers
+		// now. It will be done on a flushOutbound() when there
+		// are no more pending buffers to send.
+		c.ws.closeSent = true
+		c.ws.closeMsg = cm
+	} else {
+		c.ws.frames = append(c.ws.frames, cm)
+		c.ws.fs += int64(len(cm))
 	}
+	c.flushSignal()
 }
 
 // Enqueues a websocket close message with a status mapped from the given `reason`.
@@ -489,8 +514,10 @@ func (c *client) wsHandleProtocolError(message string) error {
 func wsCreateCloseMessage(status int, body string) []byte {
 	// Since a control message payload is limited in size, we
 	// will limit the text and add trailing "..." if truncated.
-	if len(body) > wsMaxControlPayloadSize {
-		body = body[:wsMaxControlPayloadSize-3]
+	// The body of a Close Message must be preceded with 2 bytes,
+	// so take that into account for limiting the body length.
+	if len(body) > wsMaxControlPayloadSize-2 {
+		body = body[:wsMaxControlPayloadSize-5]
 		body += "..."
 	}
 	buf := make([]byte, 2+len(body))
@@ -580,7 +607,15 @@ func (s *Server) wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsUpgradeRe
 	if opts.Websocket.HandshakeTimeout > 0 {
 		conn.SetDeadline(time.Time{})
 	}
-	return &wsUpgradeResult{conn, compress}, nil
+	result := &wsUpgradeResult{
+		conn: conn,
+		ws:   &websocket{compress: compress},
+	}
+	// Indicate if this is likely coming from a browser.
+	if ua := r.Header.Get("User-Agent"); ua != "" && strings.HasPrefix(ua, "Mozilla/") {
+		result.ws.browser = true
+	}
+	return result, nil
 }
 
 // Returns true if the header named `name` contains a token with value `value`.
@@ -797,11 +832,7 @@ func (s *Server) startWebsocketServer() {
 			s.Errorf(err.Error())
 			return
 		}
-		wsFlags := wsClient
-		if res.compress {
-			wsFlags |= wsCompress
-		}
-		s.createClient(res.conn, wsFlags)
+		s.createClient(res.conn, res.ws)
 	})
 	hs := &http.Server{
 		Addr:        hp,
@@ -851,4 +882,89 @@ func (cl *wsCaptureHTTPServerLog) Write(p []byte) (int, error) {
 	b = append(b, p[offset:]...)
 	cl.s.Errorf(string(b))
 	return len(p), nil
+}
+
+func (c *client) wsFrameOutbound(nb net.Buffers) (net.Buffers, int64) {
+	var bufs net.Buffers
+	var total = 0
+	var mfs = 0
+	if c.ws.browser {
+		mfs = wsFrameSizeForBrowsers
+	}
+
+	// If we are going to limit frame sizes and there is at leaft 1 buffer to send..
+	if mfs > 0 && len(nb) > 0 {
+		var fhIdx int
+
+		startFrame := func() {
+			bufs = append(bufs, make([]byte, wsMaxFrameHeaderSize))
+			fhIdx = len(bufs) - 1
+		}
+		endFrame := func() {
+			n := wsFillFrameHeader(bufs[fhIdx], false, wsBinaryMessage, total)
+			c.out.pb += int64(n)
+			c.ws.fs += int64(n + total)
+			bufs[fhIdx] = bufs[fhIdx][:n]
+			total = 0
+		}
+
+		for i := 0; i < len(nb); i++ {
+			if total == 0 {
+				startFrame()
+			}
+			b := nb[i]
+			if total+len(b) < mfs {
+				bufs = append(bufs, b)
+				total += len(b)
+			} else {
+				if total > 0 {
+					endFrame()
+					if len(b) < mfs {
+						i--
+						continue
+					}
+					startFrame()
+				}
+				for {
+					total = len(b)
+					if total > mfs {
+						total = mfs
+					}
+					bufs = append(bufs, b[:total])
+					if total < mfs {
+						break
+					}
+					b = b[total:]
+					endFrame()
+					if len(b) == 0 {
+						break
+					}
+					startFrame()
+				}
+			}
+		}
+		if total > 0 {
+			endFrame()
+		}
+		c.ws.frames = append(c.ws.frames, bufs...)
+	} else if len(nb) > 0 {
+		// If there is no limit on the frame size, create a single frame for
+		// all pending buffers.
+		for _, b := range nb {
+			total += len(b)
+		}
+		wsfh := wsCreateFrameHeader(false, wsBinaryMessage, total)
+		c.out.pb += int64(len(wsfh))
+		c.ws.frames = append(c.ws.frames, wsfh)
+		c.ws.frames = append(c.ws.frames, nb...)
+		c.ws.fs += int64(len(wsfh) + total)
+	}
+	bufs = c.ws.frames
+	if len(c.ws.closeMsg) > 0 {
+		bufs = append(bufs, c.ws.closeMsg)
+		c.ws.fs += int64(len(c.ws.closeMsg))
+		c.ws.closeMsg = nil
+	}
+	c.ws.frames = nil
+	return bufs, c.ws.fs
 }

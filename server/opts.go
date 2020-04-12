@@ -2772,7 +2772,7 @@ func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]erro
 			o.Websocket.TLSConfig = config
 		case "same_origin":
 			o.Websocket.SameOrigin = mv.(bool)
-		case "allowed_origins":
+		case "allowed_origins", "allowed_origin", "allow_origins", "allow_origin", "origins", "origin":
 			switch mv := mv.(type) {
 			case string:
 				o.Websocket.AllowedOrigins = []string{mv}

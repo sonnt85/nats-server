@@ -71,7 +71,7 @@ func (c *testAsyncClient) parseAndClose(proto []byte) {
 func createClientAsync(ch chan *client, s *Server, cli net.Conn) {
 	s.grWG.Add(1)
 	go func() {
-		c := s.createClient(cli, 0)
+		c := s.createClient(cli, nil)
 		// Must be here to suppress +OK
 		c.opts.Verbose = false
 		go c.writeLoop()

@@ -1452,7 +1452,7 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 		}
 		tmpDelay = ACCEPT_MIN_SLEEP
 		s.startGoRoutine(func() {
-			s.createClient(conn, 0)
+			s.createClient(conn, nil)
 			s.grWG.Done()
 		})
 	}
@@ -1713,7 +1713,7 @@ func (s *Server) copyInfo() Info {
 	return info
 }
 
-func (s *Server) createClient(conn net.Conn, initalFlags clientFlag) *client {
+func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 	// Snapshot server options.
 	opts := s.getOpts()
 
@@ -1725,8 +1725,7 @@ func (s *Server) createClient(conn net.Conn, initalFlags clientFlag) *client {
 	}
 	now := time.Now()
 
-	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: maxPay, msubs: maxSubs, start: now, last: now, flags: initalFlags}
-	ws := c.flags.isSet(wsClient)
+	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: maxPay, msubs: maxSubs, start: now, last: now, ws: ws}
 
 	c.registerWithAccount(s.globalAccount())
 
@@ -1753,7 +1752,7 @@ func (s *Server) createClient(conn net.Conn, initalFlags clientFlag) *client {
 	// TLS handshake is done (if applicable).
 	c.sendProtoNow(c.generateClientInfoJSON(info))
 
-	tlsRequired := !ws && info.TLSRequired
+	tlsRequired := ws == nil && info.TLSRequired
 	// Unlock to register
 	c.mu.Unlock()
 

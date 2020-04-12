@@ -208,17 +208,19 @@ func TestWSCreateCloseMessage(t *testing.T) {
 				}
 				return
 			}
-			if int(psize) != wsMaxControlPayloadSize {
-				t.Fatalf("Expected size to be capped to %v, got %v", wsMaxControlPayloadSize, psize)
+			// Since the payload of a close message contains a 2 byte status, the
+			// actual max text size will be wsMaxControlPayloadSize-2
+			if int(psize) != wsMaxControlPayloadSize-2 {
+				t.Fatalf("Expected size to be capped to %v, got %v", wsMaxControlPayloadSize-2, psize)
 			}
 			if string(res[len(res)-3:]) != "..." {
-				t.Fatalf("Expected res to have `...` at the end, got %q", res[2:])
+				t.Fatalf("Expected res to have `...` at the end, got %q", res[4:])
 			}
 		})
 	}
 }
 
-func TestWSFrameMessage(t *testing.T) {
+func TestWSCreateFrameHeader(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		frameType  wsOpCode
@@ -233,7 +235,7 @@ func TestWSFrameMessage(t *testing.T) {
 		{"compressed 100000", wsTextMessage, true, 100000},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			res := wsFrameMessage(test.compressed, test.frameType, test.len)
+			res := wsCreateFrameHeader(test.compressed, test.frameType, test.len)
 			// The server is always sending the message has a single frame,
 			// so the "final" bit should be set.
 			expected := byte(test.frameType) | wsFinalBit
@@ -382,7 +384,7 @@ func testWSSetupForRead() (*client, *wsReadInfo, *testReader) {
 	opts := DefaultOptions()
 	opts.MaxPending = MAX_PENDING_SIZE
 	s := &Server{opts: opts}
-	c := &client{srv: s, flags: wsClient}
+	c := &client{srv: s, ws: &websocket{}}
 	c.initClient()
 	return c, ri, tr
 }
@@ -609,7 +611,7 @@ func TestWSReadPingFrame(t *testing.T) {
 			}
 			// A PONG should have been queued with the payload of the ping
 			c.mu.Lock()
-			nb := c.collapsePtoNB()
+			nb, _ := c.wsFrameOutbound(c.collapsePtoNB())
 			c.mu.Unlock()
 			if n := len(nb); n == 0 {
 				t.Fatalf("Expected buffers, got %v", n)
@@ -654,7 +656,7 @@ func TestWSReadPongFrame(t *testing.T) {
 			}
 			// Nothing should be sent...
 			c.mu.Lock()
-			nb := c.collapsePtoNB()
+			nb, _ := c.wsFrameOutbound(c.collapsePtoNB())
 			c.mu.Unlock()
 			if n := len(nb); n != 0 {
 				t.Fatalf("Expected no buffer, got %v", n)
@@ -698,7 +700,7 @@ func TestWSReadCloseFrame(t *testing.T) {
 			}
 			// A CLOSE should have been queued with the payload of the original close message.
 			c.mu.Lock()
-			nb := c.collapsePtoNB()
+			nb, _ := c.wsFrameOutbound(c.collapsePtoNB())
 			c.mu.Unlock()
 			if n := len(nb); n == 0 {
 				t.Fatalf("Expected buffers, got %v", n)
@@ -817,7 +819,7 @@ func TestWSHandleControlFrameErrors(t *testing.T) {
 		t.Fatalf("Unexpected buffer returned: %v", n)
 	}
 	c.mu.Lock()
-	nb := c.collapsePtoNB()
+	nb, _ := c.wsFrameOutbound(c.collapsePtoNB())
 	c.mu.Unlock()
 	if n := len(nb); n == 0 {
 		t.Fatalf("Expected buffers, got %v", n)
@@ -946,7 +948,7 @@ func TestWSEnqueueCloseMsg(t *testing.T) {
 			c, _, _ := testWSSetupForRead()
 			c.wsEnqueueCloseMessage(test.reason)
 			c.mu.Lock()
-			nb := c.collapsePtoNB()
+			nb, _ := c.wsFrameOutbound(c.collapsePtoNB())
 			c.mu.Unlock()
 			if n := len(nb); n != 1 {
 				t.Fatalf("Expected 1 buffer, got %v", n)
@@ -1615,7 +1617,7 @@ func TestWSAbnormalFailureOfWebServer(t *testing.T) {
 	}
 }
 
-func testWSCreateClient(t testing.TB, compress bool, host string, port int) (net.Conn, *bufio.Reader) {
+func testWSCreateClient(t testing.TB, compress, web bool, host string, port int) (net.Conn, *bufio.Reader) {
 	addr := fmt.Sprintf("%s:%d", host, port)
 	wsc, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -1628,6 +1630,9 @@ func testWSCreateClient(t testing.TB, compress bool, host string, port int) (net
 	req := testWSCreateValidReq()
 	if compress {
 		req.Header.Set("Sec-Websocket-Extensions", "permessage-deflate")
+	}
+	if web {
+		req.Header.Set("User-Agent", "Mozilla/5.0")
 	}
 	req.URL, _ = url.Parse("wss://" + addr)
 	if err := req.Write(wsc); err != nil {
@@ -1729,7 +1734,7 @@ func TestWSPubSub(t *testing.T) {
 			checkExpectedSubs(t, 1, s)
 
 			// Now create a WS client and send a message on "foo"
-			wsc, br := testWSCreateClient(t, test.compression, o.Websocket.Host, o.Websocket.Port)
+			wsc, br := testWSCreateClient(t, test.compression, false, o.Websocket.Host, o.Websocket.Port)
 			defer wsc.Close()
 
 			// Send a WS message for "PUB foo 2\r\nok\r\n"
@@ -1921,7 +1926,7 @@ func TestWSCloseMsgSendOnConnectionClose(t *testing.T) {
 	s := RunServer(o)
 	defer s.Shutdown()
 
-	wsc, br := testWSCreateClient(t, false, o.Websocket.Host, o.Websocket.Port)
+	wsc, br := testWSCreateClient(t, false, false, o.Websocket.Host, o.Websocket.Port)
 	defer wsc.Close()
 
 	checkClientsCount(t, s, 1)
@@ -1975,7 +1980,7 @@ func TestWSAdvertise(t *testing.T) {
 	s1 := RunServer(o1)
 	defer s1.Shutdown()
 
-	wsc, br := testWSCreateClient(t, false, o1.Websocket.Host, o1.Websocket.Port)
+	wsc, br := testWSCreateClient(t, false, false, o1.Websocket.Host, o1.Websocket.Port)
 	defer wsc.Close()
 
 	o2 := testWSOptions()
@@ -2015,6 +2020,186 @@ func TestWSAdvertise(t *testing.T) {
 	s2 = RunServer(o2)
 	defer s2.Shutdown()
 	checkInfo([]string{"host1:1234", "host3:9012"})
+}
+
+func TestWSFrameOutbound(t *testing.T) {
+	c, _, _ := testWSSetupForRead()
+
+	var bufs net.Buffers
+	bufs = append(bufs, []byte("this "))
+	bufs = append(bufs, []byte("is "))
+	bufs = append(bufs, []byte("a "))
+	bufs = append(bufs, []byte("set "))
+	bufs = append(bufs, []byte("of "))
+	bufs = append(bufs, []byte("buffers"))
+	en := 2
+	for _, b := range bufs {
+		en += len(b)
+	}
+	res, n := c.wsFrameOutbound(bufs)
+	if n != int64(en) {
+		t.Fatalf("Expected size to be %v, got %v", en, n)
+	}
+	if eb := 1 + len(bufs); eb != len(res) {
+		t.Fatalf("Expected %v buffers, got %v", eb, len(res))
+	}
+	var ob []byte
+	for i := 1; i < len(res); i++ {
+		ob = append(ob, res[i]...)
+	}
+	if !bytes.Equal(ob, []byte("this is a set of buffers")) {
+		t.Fatalf("Unexpected outbound: %q", ob)
+	}
+
+	bufs = nil
+	c.out.pb = 0
+	c.ws.fs = 0
+	c.ws.frames = nil
+	c.ws.browser = true
+	bufs = append(bufs, []byte("some smaller "))
+	bufs = append(bufs, []byte("buffers"))
+	bufs = append(bufs, make([]byte, wsFrameSizeForBrowsers+10))
+	bufs = append(bufs, []byte("then some more"))
+	en = 2 + len(bufs[0]) + len(bufs[1])
+	en += 4 + len(bufs[2]) - 10
+	en += 2 + len(bufs[3]) + 10
+	res, n = c.wsFrameOutbound(bufs)
+	if n != int64(en) {
+		t.Fatalf("Expected size to be %v, got %v", en, n)
+	}
+	if len(res) != 8 {
+		t.Fatalf("Unexpected number of outbound buffers: %v", len(res))
+	}
+	if len(res[4]) != wsFrameSizeForBrowsers {
+		t.Fatalf("Big frame should have been limited to %v, got %v", wsFrameSizeForBrowsers, len(res[4]))
+	}
+	if len(res[6]) != 10 {
+		t.Fatalf("Frame 6 should have the partial of 10 bytes, got %v", len(res[6]))
+	}
+
+	bufs = nil
+	c.out.pb = 0
+	c.ws.fs = 0
+	c.ws.frames = nil
+	c.ws.browser = true
+	bufs = append(bufs, []byte("some smaller "))
+	bufs = append(bufs, []byte("buffers"))
+	// Have one of the exact max size
+	bufs = append(bufs, make([]byte, wsFrameSizeForBrowsers))
+	bufs = append(bufs, []byte("then some more"))
+	en = 2 + len(bufs[0]) + len(bufs[1])
+	en += 4 + len(bufs[2])
+	en += 2 + len(bufs[3])
+	res, n = c.wsFrameOutbound(bufs)
+	if n != int64(en) {
+		t.Fatalf("Expected size to be %v, got %v", en, n)
+	}
+	if len(res) != 7 {
+		t.Fatalf("Unexpected number of outbound buffers: %v", len(res))
+	}
+	if len(res[4]) != wsFrameSizeForBrowsers {
+		t.Fatalf("Big frame should have been limited to %v, got %v", wsFrameSizeForBrowsers, len(res[4]))
+	}
+	if string(res[6]) != string(bufs[3]) {
+		t.Fatalf("Frame 6 should be %q, got %q", bufs[3], res[6])
+	}
+
+	bufs = nil
+	c.out.pb = 0
+	c.ws.fs = 0
+	c.ws.frames = nil
+	c.ws.browser = true
+	bufs = append(bufs, []byte("some smaller "))
+	bufs = append(bufs, []byte("buffers"))
+	// Have one of the exact max size, and last in the list
+	bufs = append(bufs, make([]byte, wsFrameSizeForBrowsers))
+	en = 2 + len(bufs[0]) + len(bufs[1])
+	en += 4 + len(bufs[2])
+	res, n = c.wsFrameOutbound(bufs)
+	if n != int64(en) {
+		t.Fatalf("Expected size to be %v, got %v", en, n)
+	}
+	if len(res) != 5 {
+		t.Fatalf("Unexpected number of outbound buffers: %v", len(res))
+	}
+	if len(res[4]) != wsFrameSizeForBrowsers {
+		t.Fatalf("Big frame should have been limited to %v, got %v", wsFrameSizeForBrowsers, len(res[4]))
+	}
+
+	bufs = nil
+	c.out.pb = 0
+	c.ws.fs = 0
+	c.ws.frames = nil
+	c.ws.browser = true
+	bufs = append(bufs, []byte("some smaller buffer"))
+	bufs = append(bufs, make([]byte, wsFrameSizeForBrowsers-5))
+	bufs = append(bufs, []byte("then some more"))
+	en = 2 + len(bufs[0])
+	en += 4 + len(bufs[1])
+	en += 2 + len(bufs[2])
+	res, n = c.wsFrameOutbound(bufs)
+	if n != int64(en) {
+		t.Fatalf("Expected size to be %v, got %v", en, n)
+	}
+	if len(res) != 6 {
+		t.Fatalf("Unexpected number of outbound buffers: %v", len(res))
+	}
+	if len(res[3]) != wsFrameSizeForBrowsers-5 {
+		t.Fatalf("Big frame should have been limited to %v, got %v", wsFrameSizeForBrowsers, len(res[4]))
+	}
+	if string(res[5]) != string(bufs[2]) {
+		t.Fatalf("Frame 6 should be %q, got %q", bufs[2], res[5])
+	}
+}
+
+func TestWSWebrowserClient(t *testing.T) {
+	o := testWSOptions()
+	o.DisableShortFirstPing = true
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	wsc, br := testWSCreateClient(t, false, true, o.Websocket.Host, o.Websocket.Port)
+	defer wsc.Close()
+
+	checkClientsCount(t, s, 1)
+	var c *client
+	s.mu.Lock()
+	for _, cli := range s.clients {
+		c = cli
+		break
+	}
+	s.mu.Unlock()
+
+	proto := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("SUB foo 1\r\nPING\r\n"))
+	wsc.Write(proto)
+	if res := testWSReadFrame(t, br); !bytes.Equal(res, []byte(pongProto)) {
+		t.Fatalf("Expected PONG back")
+	}
+
+	c.mu.Lock()
+	ok := c.ws != nil && c.ws.browser == true
+	c.mu.Unlock()
+	if !ok {
+		t.Fatalf("Client is not marked as webrowser client")
+	}
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	// Send a big message and check that it is received in smaller frames
+	psize := 204813
+	nc.Publish("foo", make([]byte, psize))
+	nc.Flush()
+
+	rsize := psize + len(fmt.Sprintf("MSG foo %d\r\n\r\n", psize))
+	nframes := 0
+	for total := 0; total < rsize; nframes++ {
+		res := testWSReadFrame(t, br)
+		total += len(res)
+	}
+	if expected := psize / wsFrameSizeForBrowsers; expected > nframes {
+		t.Fatalf("Expected %v frames, got %v", expected, nframes)
+	}
 }
 
 // ==================================================================
@@ -2100,7 +2285,7 @@ func wsBenchPub(b *testing.B, numPubs int, compress bool, payload string) {
 	}
 	var pubs []pub
 	for i := 0; i < numPubs; i++ {
-		wsc, br := testWSCreateClient(b, compress, opts.Websocket.Host, opts.Websocket.Port)
+		wsc, br := testWSCreateClient(b, compress, false, opts.Websocket.Host, opts.Websocket.Port)
 		defer wsc.Close()
 		bw := bufio.NewWriterSize(wsc, bufSize)
 		pubs = append(pubs, pub{wsc, br, bw})
@@ -2262,7 +2447,7 @@ func wsBenchSub(b *testing.B, numSubs int, compress bool, payload string) {
 
 	var subs []*bufio.Reader
 	for i := 0; i < numSubs; i++ {
-		wsc, br := testWSCreateClient(b, compress, opts.Websocket.Host, opts.Websocket.Port)
+		wsc, br := testWSCreateClient(b, compress, false, opts.Websocket.Host, opts.Websocket.Port)
 		defer wsc.Close()
 		subProto := testWSCreateClientMsg(wsBinaryMessage, 1, true, compress,
 			[]byte(fmt.Sprintf("SUB %s 1\r\nPING\r\n", testWSBenchSubject)))

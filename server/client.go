@@ -108,14 +108,6 @@ const (
 	writeLoopStarted                         // Marks that the writeLoop has been started.
 	skipFlushOnClose                         // Marks that flushOutbound() should not be called on connection close.
 	expectConnect                            // Marks if this connection is expected to send a CONNECT
-
-	// We will get rid of these flags if we decide to move the ws framing from
-	// "enqueueing" to "flushOutbound", which then would require to maintain state
-	// about partials, so would likely have a *client.websocket structure that would
-	// at the same time hold this information.
-	wsClient       // Marks that this is a websocket client
-	wsCompress     // Marks that compression has been negotiated with this client
-	wsCloseMsgSent // Marks that the CloseMessage has been sent to this websocket client
 )
 
 // set the flag (would be equivalent to set the boolean to true)
@@ -231,6 +223,7 @@ type client struct {
 	route *route
 	gw    *gateway
 	leaf  *leaf
+	ws    *websocket
 
 	// To keep track of gateway replies mapping
 	gwrm map[string]*gwReplyMap
@@ -263,7 +256,6 @@ type outbound struct {
 	mp  int64         // Snapshot of max pending for client.
 	lft time.Duration // Last flush time for Write.
 	stc chan struct{} // Stall chan we create to slow down producers on overrun, e.g. fan-in.
-	lwb int32         // Last byte size of Write.
 }
 
 type perm struct {
@@ -492,7 +484,7 @@ func (c *client) initClient() {
 	switch c.kind {
 	case CLIENT:
 		name := "cid"
-		if c.flags.isSet(wsClient) {
+		if c.ws != nil {
 			name = "wid"
 		}
 		c.ncs = fmt.Sprintf("%s - %s:%d", conn, name, c.cid)
@@ -870,7 +862,7 @@ func (c *client) readLoop() {
 		return
 	}
 	nc := c.nc
-	ws := c.flags.isSet(wsClient)
+	ws := c.ws != nil
 	c.in.rsz = startBufSize
 	// Snapshot max control line since currently can not be changed on reload and we
 	// were checking it on each call to parse. If this changes and we allow MaxControlLine
@@ -1046,6 +1038,10 @@ func (c *client) collapsePtoNB() net.Buffers {
 // This will handle the fixup needed on a partial write.
 // Assume pending has been already calculated correctly.
 func (c *client) handlePartialWrite(pnb net.Buffers) {
+	if c.ws != nil {
+		c.ws.frames = pnb
+		return
+	}
 	nb := c.collapsePtoNB()
 	// The partial needs to be first, so append nb to pnb
 	c.out.nb = append(pnb, nb...)
@@ -1076,6 +1072,11 @@ func (c *client) flushOutbound() bool {
 	nb := c.collapsePtoNB()
 	c.out.p, c.out.nb, c.out.s = c.out.s, nil, nil
 
+	attempted := c.out.pb
+	if c.ws != nil {
+		nb, attempted = c.wsFrameOutbound(nb)
+	}
+
 	// For selecting primary replacement.
 	cnb := nb
 	var lfs int
@@ -1085,7 +1086,6 @@ func (c *client) flushOutbound() bool {
 
 	// In case it goes away after releasing the lock.
 	nc := c.nc
-	attempted := c.out.pb
 	apm := c.out.pm
 
 	// Capture this (we change the value in some tests)
@@ -1121,29 +1121,31 @@ func (c *client) flushOutbound() bool {
 				report = c.Errorf
 			}
 			report("Error flushing: %v", err)
-			c.markConnAsClosed(WriteError, true)
+			c.markConnAsClosed(WriteError)
 			return true
 		}
 	}
 
 	// Update flush time statistics.
 	c.out.lft = lft
-	c.out.lwb = int32(n)
 
 	// Subtract from pending bytes and messages.
-	c.out.pb -= int64(c.out.lwb)
+	c.out.pb -= n
+	if c.ws != nil {
+		c.ws.fs -= n
+	}
 	c.out.pm -= apm // FIXME(dlc) - this will not be totally accurate on partials.
 
 	// Check for partial writes
 	// TODO(dlc) - zero write with no error will cause lost message and the writeloop to spin.
-	if int64(c.out.lwb) != attempted && n > 0 {
+	if n != attempted && n > 0 {
 		c.handlePartialWrite(nb)
-	} else if c.out.lwb >= c.out.sz {
+	} else if int32(n) >= c.out.sz {
 		c.out.sws = 0
 	}
 
 	// Adjust based on what we wrote plus any pending.
-	pt := int64(c.out.lwb) + c.out.pb
+	pt := n + c.out.pb
 
 	// Adjust sz as needed downward, keeping power of 2.
 	// We do this at a slower rate.
@@ -1179,7 +1181,7 @@ func (c *client) flushOutbound() bool {
 
 	// Check if we have a stalled gate and if so and we are recovering release
 	// any stalled producers. Only kind==CLIENT will stall.
-	if c.out.stc != nil && (int64(c.out.lwb) == attempted || c.out.pb < c.out.mp/2) {
+	if c.out.stc != nil && (n == attempted || c.out.pb < c.out.mp/2) {
 		close(c.out.stc)
 		c.out.stc = nil
 	}
@@ -1194,7 +1196,7 @@ func (c *client) handleWriteTimeout(written, attempted int64, numChunks int) boo
 	if tlsConn, ok := c.nc.(*tls.Conn); ok {
 		if !tlsConn.ConnectionState().HandshakeComplete {
 			// Likely a TLSTimeout error instead...
-			c.markConnAsClosed(TLSHandshakeError, true)
+			c.markConnAsClosed(TLSHandshakeError)
 			// Would need to coordinate with tlstimeout()
 			// to avoid double logging, so skip logging
 			// here, and don't report a slow consumer error.
@@ -1205,7 +1207,7 @@ func (c *client) handleWriteTimeout(written, attempted int64, numChunks int) boo
 		// before the authorization timeout. If that is the case, then we handle
 		// as slow consumer though we do not increase the counter as that can be
 		// misleading.
-		c.markConnAsClosed(SlowConsumerWriteDeadline, true)
+		c.markConnAsClosed(SlowConsumerWriteDeadline)
 		return true
 	}
 
@@ -1216,31 +1218,43 @@ func (c *client) handleWriteTimeout(written, attempted int64, numChunks int) boo
 
 	// We always close CLIENT connections, or when nothing was written at all...
 	if c.kind == CLIENT || written == 0 {
-		c.markConnAsClosed(SlowConsumerWriteDeadline, true)
+		c.markConnAsClosed(SlowConsumerWriteDeadline)
 		return true
 	}
 	return false
 }
 
 // Marks this connection has closed with the given reason.
-// Sets the closeConnection flag and skipFlushOnClose flag if asked.
+// Sets the closeConnection flag and skipFlushOnClose depending on the reason.
 // Depending on the kind of connection, the connection will be saved.
 // If a writeLoop has been started, the final flush/close/teardown will
 // be done there, otherwise flush and close of TCP connection is done here in place.
 // Returns true if closed in place, flase otherwise.
 // Lock is held on entry.
-func (c *client) markConnAsClosed(reason ClosedState, skipFlush bool) bool {
+func (c *client) markConnAsClosed(reason ClosedState) bool {
+	// Possibly set skipFlushOnClose flag even if connection has already been
+	// mark as closed. The rationale is that a connection may be closed with
+	// a reason that justifies a flush (say after sending an -ERR), but then
+	// the flushOutbound() gets a write error. If that happens, connection
+	// being lost, there is no reason to attempt to flush again during the
+	// teardown when the writeLoop exits.
+	var skipFlush bool
+	switch reason {
+	case ReadError, WriteError, SlowConsumerPendingBytes,
+		SlowConsumerWriteDeadline, TLSHandshakeError:
+		c.flags.set(skipFlushOnClose)
+		skipFlush = true
+	default:
+	}
 	if c.flags.isSet(closeConnection) {
 		return false
 	}
-	if skipFlush {
-		c.flags.set(skipFlushOnClose)
-	} else if c.flags.isSet(wsClient) && !c.flags.isSet(wsCloseMsgSent) {
+	c.flags.set(closeConnection)
+	// For a websocket client, unless we are told not to flush, enqueue
+	// a websocket CloseMessage based on the reason.
+	if !skipFlush && c.ws != nil && !c.ws.closeSent {
 		c.wsEnqueueCloseMessage(reason)
 	}
-	// Do not set until after possibly calling wsEnqueueCloseMessage()
-	// otherwise queueOutbound() would be a no-op.
-	c.flags.set(closeConnection)
 	// Save off the connection if its a client or leafnode.
 	if c.kind == CLIENT || c.kind == LEAF {
 		if nc := c.nc; nc != nil && c.srv != nil {
@@ -1612,7 +1626,7 @@ func (c *client) queueOutbound(data []byte) bool {
 		c.out.pb -= int64(len(data))
 		atomic.AddInt64(&c.srv.slowConsumers, 1)
 		c.Noticef("Slow Consumer Detected: MaxPending of %d Exceeded", c.out.mp)
-		c.markConnAsClosed(SlowConsumerPendingBytes, true)
+		c.markConnAsClosed(SlowConsumerPendingBytes)
 		return referenced
 	}
 
@@ -1687,22 +1701,6 @@ func (c *client) enqueueProtoAndFlush(proto []byte, doFlush bool) {
 	if c.isClosed() {
 		return
 	}
-	if c.flags.isSet(wsClient) {
-		// TODO: framing each proto degrades performance when compression
-		// is in used, I think. It may be more efficient to frame/compress
-		// in flushOutbound when aggregating buffers and ready to write.
-		// However, because of compression, it would be difficult to handle
-		// partial writes. Also, when there is a need to send WS control
-		// messages, these need to be framed separately.
-		var wsfh []byte
-		cl := defaultCompressionLevel
-		if c.srv != nil {
-			cl = c.srv.websocket.compressionLevel
-		}
-		wsfh, proto = wsCreateFrameAndPayload(wsBinaryMessage,
-			c.flags.isSet(wsCompress), cl, proto)
-		c.queueOutbound(wsfh)
-	}
 	c.queueOutbound(proto)
 	if !(doFlush && c.flushOutbound()) {
 		c.flushSignal()
@@ -1773,7 +1771,7 @@ func (c *client) generateClientInfoJSON(info Info) []byte {
 	info.CID = c.cid
 	info.ClientIP = c.host
 	info.MaxPayload = c.mpay
-	if c.flags.isSet(wsClient) {
+	if c.ws != nil {
 		info.ClientConnectURLs = info.WSConnectURLs
 	}
 	info.WSConnectURLs = nil
@@ -2588,18 +2586,8 @@ func (c *client) deliverMsg(sub *subscription, subject, mh, msg []byte, gwrply b
 	}
 
 	// Queue to outbound buffer
-	if client.flags.isSet(wsClient) {
-		// For WS client, need to call enqueueProto() with complete protocol.
-		// The call enqueueProto() will correctly WS frame and possibly
-		// compress the payload.
-		completeProto := make([]byte, len(mh)+len(msg))
-		copy(completeProto, mh)
-		copy(completeProto[len(mh):], msg)
-		client.enqueueProto(completeProto)
-	} else {
-		client.queueOutbound(mh)
-		client.queueOutbound(msg)
-	}
+	client.queueOutbound(mh)
+	client.queueOutbound(msg)
 
 	client.out.pm++
 
@@ -3567,7 +3555,7 @@ func (c *client) closeConnection(reason ClosedState) {
 	// This will set the closeConnection flag and save the connection, etc..
 	// Will return true if no writeLoop was started and TCP connection was
 	// closed in place, in which case we need to do the teardown.
-	teardownNow := c.markConnAsClosed(reason, false)
+	teardownNow := c.markConnAsClosed(reason)
 	c.mu.Unlock()
 
 	if teardownNow {
