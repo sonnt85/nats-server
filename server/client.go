@@ -911,6 +911,9 @@ func (c *client) readLoop() {
 		if ws {
 			bufs, err = c.wsRead(wsr, nc, b[:n])
 			if bufs == nil && err != nil {
+				if err != io.EOF {
+					c.Errorf("read error: %v", err)
+				}
 				c.closeConnection(closedStateForErr(err))
 			} else if bufs == nil {
 				continue
@@ -1026,23 +1029,26 @@ func closedStateForErr(err error) ClosedState {
 
 // collapsePtoNB will place primary onto nb buffer as needed in prep for WriteTo.
 // This will return a copy on purpose.
-func (c *client) collapsePtoNB() net.Buffers {
+func (c *client) collapsePtoNB() (net.Buffers, int64) {
+	if c.ws != nil {
+		return c.wsCollapsePtoNB()
+	}
 	if c.out.p != nil {
 		p := c.out.p
 		c.out.p = nil
-		return append(c.out.nb, p)
+		return append(c.out.nb, p), c.out.pb
 	}
-	return c.out.nb
+	return c.out.nb, c.out.pb
 }
 
 // This will handle the fixup needed on a partial write.
 // Assume pending has been already calculated correctly.
 func (c *client) handlePartialWrite(pnb net.Buffers) {
 	if c.ws != nil {
-		c.ws.frames = pnb
+		c.ws.frames = append(pnb, c.ws.frames...)
 		return
 	}
-	nb := c.collapsePtoNB()
+	nb, _ := c.collapsePtoNB()
 	// The partial needs to be first, so append nb to pnb
 	c.out.nb = append(pnb, nb...)
 }
@@ -1069,12 +1075,10 @@ func (c *client) flushOutbound() bool {
 	}
 
 	// Place primary on nb, assign primary to secondary, nil out nb and secondary.
-	nb := c.collapsePtoNB()
+	nb, attempted := c.collapsePtoNB()
 	c.out.p, c.out.nb, c.out.s = c.out.s, nil, nil
-
-	attempted := c.out.pb
-	if c.ws != nil {
-		nb, attempted = c.wsFrameOutbound(nb)
+	if nb == nil {
+		return true
 	}
 
 	// For selecting primary replacement.
@@ -1107,7 +1111,8 @@ func (c *client) flushOutbound() bool {
 	// Re-acquire client lock.
 	c.mu.Lock()
 
-	if err != nil {
+	// Ignore ErrShortWrite errors, they will be handled as partials.
+	if err != nil && err != io.ErrShortWrite {
 		// Handle timeout error (slow consumer) differently
 		if ne, ok := err.(net.Error); ok && ne.Timeout() {
 			if closed := c.handleWriteTimeout(n, attempted, len(cnb)); closed {

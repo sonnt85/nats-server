@@ -287,9 +287,6 @@ func NewServer(opts *Options) (*Server, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Capture option's compression level in the server object
-	// for faster access (needed in websocket clients when sending)
-	s.websocket.compressionLevel = opts.Websocket.CompressionLevel
 	// Used internally for quick look-ups.
 	s.websocket.connectURLsMap = make(map[string]struct{})
 

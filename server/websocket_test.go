@@ -280,59 +280,6 @@ func TestWSCreateFrameHeader(t *testing.T) {
 	}
 }
 
-func TestWSCreateFrameAndPayload(t *testing.T) {
-	uncompressed := []byte("this is a buffer with some data that is compresseddddddddddddddddddddd")
-	buf := &bytes.Buffer{}
-	compressor, _ := flate.NewWriter(buf, 1)
-	compressor.Write(uncompressed)
-	compressor.Flush()
-	compressed := buf.Bytes()
-	// The last 4 bytes are dropped
-	compressed = compressed[:len(compressed)-4]
-
-	for _, test := range []struct {
-		name       string
-		frameType  wsOpCode
-		compressed bool
-	}{
-		{"binary", wsBinaryMessage, false},
-		{"binary compressed", wsBinaryMessage, true},
-		{"text", wsTextMessage, false},
-		{"text compressed", wsTextMessage, true},
-		{"ping", wsPingMessage, false},
-		{"ping compressed", wsPingMessage, true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			// If compression, stress the fact that we use a pool and
-			// want to get to the case where we get from the pool and reset.
-			iter := 1
-			if test.compressed {
-				iter = 10
-			}
-			for i := 0; i < iter; i++ {
-				header, payload := wsCreateFrameAndPayload(test.frameType, test.compressed, 1, uncompressed)
-				expectedB0 := byte(test.frameType) | wsFinalBit
-				expectedB1 := byte(len(uncompressed))
-				expectedPS := len(uncompressed)
-				if test.compressed && !wsIsControlFrame(test.frameType) {
-					expectedB0 |= wsRsv1Bit
-					expectedPS = len(compressed)
-					expectedB1 = byte(expectedPS)
-				}
-				if b := header[0]; b != expectedB0 {
-					t.Fatalf("Expected first byte to be %v, got %v", expectedB0, b)
-				}
-				if b := header[1]; b != expectedB1 {
-					t.Fatalf("Expected second byte to be %v, got %v", expectedB1, b)
-				}
-				if len(payload) != expectedPS {
-					t.Fatalf("Expected payload length to be %v, got %v", expectedPS, len(payload))
-				}
-			}
-		})
-	}
-}
-
 func testWSCreateClientMsg(frameType wsOpCode, frameNum int, final, compressed bool, payload []byte) []byte {
 	if compressed {
 		buf := &bytes.Buffer{}
@@ -611,7 +558,7 @@ func TestWSReadPingFrame(t *testing.T) {
 			}
 			// A PONG should have been queued with the payload of the ping
 			c.mu.Lock()
-			nb, _ := c.wsFrameOutbound(c.collapsePtoNB())
+			nb, _ := c.collapsePtoNB()
 			c.mu.Unlock()
 			if n := len(nb); n == 0 {
 				t.Fatalf("Expected buffers, got %v", n)
@@ -656,7 +603,7 @@ func TestWSReadPongFrame(t *testing.T) {
 			}
 			// Nothing should be sent...
 			c.mu.Lock()
-			nb, _ := c.wsFrameOutbound(c.collapsePtoNB())
+			nb, _ := c.collapsePtoNB()
 			c.mu.Unlock()
 			if n := len(nb); n != 0 {
 				t.Fatalf("Expected no buffer, got %v", n)
@@ -700,7 +647,7 @@ func TestWSReadCloseFrame(t *testing.T) {
 			}
 			// A CLOSE should have been queued with the payload of the original close message.
 			c.mu.Lock()
-			nb, _ := c.wsFrameOutbound(c.collapsePtoNB())
+			nb, _ := c.collapsePtoNB()
 			c.mu.Unlock()
 			if n := len(nb); n == 0 {
 				t.Fatalf("Expected buffers, got %v", n)
@@ -819,7 +766,7 @@ func TestWSHandleControlFrameErrors(t *testing.T) {
 		t.Fatalf("Unexpected buffer returned: %v", n)
 	}
 	c.mu.Lock()
-	nb, _ := c.wsFrameOutbound(c.collapsePtoNB())
+	nb, _ := c.collapsePtoNB()
 	c.mu.Unlock()
 	if n := len(nb); n == 0 {
 		t.Fatalf("Expected buffers, got %v", n)
@@ -948,7 +895,7 @@ func TestWSEnqueueCloseMsg(t *testing.T) {
 			c, _, _ := testWSSetupForRead()
 			c.wsEnqueueCloseMessage(test.reason)
 			c.mu.Lock()
-			nb, _ := c.wsFrameOutbound(c.collapsePtoNB())
+			nb, _ := c.collapsePtoNB()
 			c.mu.Unlock()
 			if n := len(nb); n != 1 {
 				t.Fatalf("Expected 1 buffer, got %v", n)
@@ -1035,6 +982,7 @@ func (trw *testResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func testWSOptions() *Options {
 	opts := DefaultOptions()
+	opts.DisableShortFirstPing = true
 	opts.Websocket.Host = "127.0.0.1"
 	opts.Websocket.Port = -1
 	var err error
@@ -1337,7 +1285,6 @@ func TestWSCompressNegotiation(t *testing.T) {
 
 	// Option in the server and client, so compression should be negotiated.
 	s.opts.Websocket.Compression = true
-	s.opts.Websocket.CompressionLevel = defaultCompressionLevel
 	rw = &testResponseWriter{}
 	res, err = s.wsUpgrade(rw, req)
 	if res == nil || err != nil {
@@ -1503,9 +1450,6 @@ func TestWSValidateOptions(t *testing.T) {
 			o.Websocket.AllowedOrigins = []string{"http://this:is:bad:url"}
 			return o
 		}, "unable to parse"},
-		// Although not supported, still check
-		{"bad compression level", func() *Options { o := wso.Clone(); o.Websocket.CompressionLevel = -10; return o }, "valid range"},
-		{"bad compression level", func() *Options { o := wso.Clone(); o.Websocket.CompressionLevel = 20; return o }, "valid range"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			err := validateWebsocketOptions(test.getOpts())
@@ -1618,6 +1562,7 @@ func TestWSAbnormalFailureOfWebServer(t *testing.T) {
 }
 
 func testWSCreateClient(t testing.TB, compress, web bool, host string, port int) (net.Conn, *bufio.Reader) {
+	t.Helper()
 	addr := fmt.Sprintf("%s:%d", host, port)
 	wsc, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -1664,6 +1609,7 @@ func testWSCreateClient(t testing.TB, compress, web bool, host string, port int)
 }
 
 func testWSReadFrame(t testing.TB, br *bufio.Reader) []byte {
+	t.Helper()
 	fh := [2]byte{}
 	if _, err := io.ReadAtLeast(br, fh[:2], 2); err != nil {
 		t.Fatalf("Error reading frame: %v", err)
@@ -1696,17 +1642,11 @@ func testWSReadFrame(t testing.TB, br *bufio.Reader) []byte {
 	}
 	buf = append(buf, 0x00, 0x00, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff)
 	dbr := bytes.NewBuffer(buf)
-	d, _ := decompressorPool.Get().(io.ReadCloser)
-	if d == nil {
-		d = flate.NewReader(dbr)
-	} else {
-		d.(flate.Resetter).Reset(dbr, nil)
-	}
+	d := flate.NewReader(dbr)
 	uncompressed, err := ioutil.ReadAll(d)
 	if err != nil {
 		t.Fatalf("Error reading frame: %v", err)
 	}
-	decompressorPool.Put(d)
 	return uncompressed
 }
 
@@ -1722,7 +1662,6 @@ func TestWSPubSub(t *testing.T) {
 			o := testWSOptions()
 			if test.compression {
 				o.Websocket.Compression = true
-				o.Websocket.CompressionLevel = defaultCompressionLevel
 			}
 			s := RunServer(o)
 			defer s.Shutdown()
@@ -2036,7 +1975,10 @@ func TestWSFrameOutbound(t *testing.T) {
 	for _, b := range bufs {
 		en += len(b)
 	}
-	res, n := c.wsFrameOutbound(bufs)
+	c.mu.Lock()
+	c.out.nb = bufs
+	res, n := c.collapsePtoNB()
+	c.mu.Unlock()
 	if n != int64(en) {
 		t.Fatalf("Expected size to be %v, got %v", en, n)
 	}
@@ -2063,7 +2005,10 @@ func TestWSFrameOutbound(t *testing.T) {
 	en = 2 + len(bufs[0]) + len(bufs[1])
 	en += 4 + len(bufs[2]) - 10
 	en += 2 + len(bufs[3]) + 10
-	res, n = c.wsFrameOutbound(bufs)
+	c.mu.Lock()
+	c.out.nb = bufs
+	res, n = c.collapsePtoNB()
+	c.mu.Unlock()
 	if n != int64(en) {
 		t.Fatalf("Expected size to be %v, got %v", en, n)
 	}
@@ -2090,7 +2035,10 @@ func TestWSFrameOutbound(t *testing.T) {
 	en = 2 + len(bufs[0]) + len(bufs[1])
 	en += 4 + len(bufs[2])
 	en += 2 + len(bufs[3])
-	res, n = c.wsFrameOutbound(bufs)
+	c.mu.Lock()
+	c.out.nb = bufs
+	res, n = c.collapsePtoNB()
+	c.mu.Unlock()
 	if n != int64(en) {
 		t.Fatalf("Expected size to be %v, got %v", en, n)
 	}
@@ -2115,7 +2063,10 @@ func TestWSFrameOutbound(t *testing.T) {
 	bufs = append(bufs, make([]byte, wsFrameSizeForBrowsers))
 	en = 2 + len(bufs[0]) + len(bufs[1])
 	en += 4 + len(bufs[2])
-	res, n = c.wsFrameOutbound(bufs)
+	c.mu.Lock()
+	c.out.nb = bufs
+	res, n = c.collapsePtoNB()
+	c.mu.Unlock()
 	if n != int64(en) {
 		t.Fatalf("Expected size to be %v, got %v", en, n)
 	}
@@ -2137,7 +2088,10 @@ func TestWSFrameOutbound(t *testing.T) {
 	en = 2 + len(bufs[0])
 	en += 4 + len(bufs[1])
 	en += 2 + len(bufs[2])
-	res, n = c.wsFrameOutbound(bufs)
+	c.mu.Lock()
+	c.out.nb = bufs
+	res, n = c.collapsePtoNB()
+	c.mu.Unlock()
 	if n != int64(en) {
 		t.Fatalf("Expected size to be %v, got %v", en, n)
 	}
@@ -2154,7 +2108,6 @@ func TestWSFrameOutbound(t *testing.T) {
 
 func TestWSWebrowserClient(t *testing.T) {
 	o := testWSOptions()
-	o.DisableShortFirstPing = true
 	s := RunServer(o)
 	defer s.Shutdown()
 
@@ -2202,6 +2155,240 @@ func TestWSWebrowserClient(t *testing.T) {
 	}
 }
 
+type testWSWrappedConn struct {
+	net.Conn
+	mu      sync.RWMutex
+	buf     *bytes.Buffer
+	partial bool
+}
+
+func (wc *testWSWrappedConn) Write(p []byte) (int, error) {
+	wc.mu.Lock()
+	defer wc.mu.Unlock()
+	var err error
+	n := len(p)
+	if wc.partial && n > 10 {
+		n = 10
+		err = io.ErrShortWrite
+	}
+	p = p[:n]
+	wc.buf.Write(p)
+	wc.Conn.Write(p)
+	return n, err
+}
+
+func TestWSCompressionBasic(t *testing.T) {
+	payload := "This is the content of a message that will be compresseddddddddddddddddddddd."
+	msgProto := fmt.Sprintf("MSG foo 1 %d\r\n%s\r\n", len(payload), payload)
+
+	cbuf := &bytes.Buffer{}
+	compressor, _ := flate.NewWriter(cbuf, flate.BestSpeed)
+	compressor.Write([]byte(msgProto))
+	compressor.Close()
+	compressed := cbuf.Bytes()
+	// The last 4 bytes are dropped
+	compressed = compressed[:len(compressed)-4]
+
+	o := testWSOptions()
+	o.Websocket.Compression = true
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	c, br := testWSCreateClient(t, true, false, o.Websocket.Host, o.Websocket.Port)
+	defer c.Close()
+
+	proto := testWSCreateClientMsg(wsBinaryMessage, 1, true, true, []byte("SUB foo 1\r\nPING\r\n"))
+	c.Write(proto)
+	l := testWSReadFrame(t, br)
+	if !bytes.Equal(l, []byte(pongProto)) {
+		t.Fatalf("Expected PONG, got %q", l)
+	}
+
+	var wc *testWSWrappedConn
+	s.mu.Lock()
+	for _, c := range s.clients {
+		c.mu.Lock()
+		wc = &testWSWrappedConn{Conn: c.nc, buf: &bytes.Buffer{}}
+		c.nc = wc
+		c.mu.Unlock()
+	}
+	s.mu.Unlock()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	natsPub(t, nc, "foo", []byte(payload))
+
+	res := &bytes.Buffer{}
+	for total := 0; total < len(msgProto); {
+		l := testWSReadFrame(t, br)
+		n, _ := res.Write(l)
+		total += n
+	}
+	if !bytes.Equal([]byte(msgProto), res.Bytes()) {
+		t.Fatalf("Unexpected result: %q", res)
+	}
+
+	// Now check the wrapped connection buffer to check that data was actually compressed.
+	wc.mu.RLock()
+	res = wc.buf
+	wc.mu.RUnlock()
+	if bytes.Contains(res.Bytes(), []byte(payload)) {
+		t.Fatalf("Looks like frame was not compressed: %q", res.Bytes())
+	}
+	header := res.Bytes()[:2]
+	body := res.Bytes()[2:]
+	expectedB0 := byte(wsBinaryMessage) | wsFinalBit | wsRsv1Bit
+	expectedPS := len(compressed)
+	expectedB1 := byte(expectedPS)
+
+	if b := header[0]; b != expectedB0 {
+		t.Fatalf("Expected first byte to be %v, got %v", expectedB0, b)
+	}
+	if b := header[1]; b != expectedB1 {
+		t.Fatalf("Expected second byte to be %v, got %v", expectedB1, b)
+	}
+	if len(body) != expectedPS {
+		t.Fatalf("Expected payload length to be %v, got %v", expectedPS, len(body))
+	}
+	if !bytes.Equal(body, compressed) {
+		t.Fatalf("Unexpected compress body: %q", body)
+	}
+}
+
+func TestWSCompressionWithPartialWrite(t *testing.T) {
+	payload := "This is the content of a message that will be compresseddddddddddddddddddddd."
+	msgProto := fmt.Sprintf("MSG foo 1 %d\r\n%s\r\n", len(payload), payload)
+
+	o := testWSOptions()
+	o.Websocket.Compression = true
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	c, br := testWSCreateClient(t, true, false, o.Websocket.Host, o.Websocket.Port)
+	defer c.Close()
+
+	proto := testWSCreateClientMsg(wsBinaryMessage, 1, true, true, []byte("SUB foo 1\r\nPING\r\n"))
+	c.Write(proto)
+	l := testWSReadFrame(t, br)
+	if !bytes.Equal(l, []byte(pongProto)) {
+		t.Fatalf("Expected PONG, got %q", l)
+	}
+
+	pingPayload := []byte("my ping")
+	pingFromWSClient := testWSCreateClientMsg(wsPingMessage, 1, true, false, pingPayload)
+
+	var wc *testWSWrappedConn
+	var ws *client
+	s.mu.Lock()
+	for _, c := range s.clients {
+		ws = c
+		c.mu.Lock()
+		wc = &testWSWrappedConn{
+			Conn: c.nc,
+			buf:  &bytes.Buffer{},
+		}
+		c.nc = wc
+		c.mu.Unlock()
+		break
+	}
+	s.mu.Unlock()
+
+	wc.mu.Lock()
+	wc.partial = true
+	wc.mu.Unlock()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	expected := &bytes.Buffer{}
+	for i := 0; i < 10; i++ {
+		if i > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		expected.Write([]byte(msgProto))
+		natsPub(t, nc, "foo", []byte(payload))
+		if i == 1 {
+			c.Write(pingFromWSClient)
+		}
+	}
+
+	var gotPingResponse bool
+	res := &bytes.Buffer{}
+	for total := 0; total < 10*len(msgProto); {
+		l := testWSReadFrame(t, br)
+		if bytes.Equal(l, pingPayload) {
+			gotPingResponse = true
+		} else {
+			n, _ := res.Write(l)
+			total += n
+		}
+	}
+	if !bytes.Equal(expected.Bytes(), res.Bytes()) {
+		t.Fatalf("Unexpected result: %q", res)
+	}
+	if !gotPingResponse {
+		t.Fatal("Did not get the ping response")
+	}
+
+	ws.mu.Lock()
+	pb := ws.out.pb
+	wf := ws.ws.frames
+	fs := ws.ws.fs
+	ws.mu.Unlock()
+	if pb != 0 {
+		t.Fatalf("Expected pb to be 0, got %v", pb)
+	}
+	if len(wf) != 0 {
+		t.Fatalf("Should not be any frames left to send, got %v", wf)
+	}
+	if fs != 0 {
+		t.Fatalf("Frame size should be 0, got %v", fs)
+	}
+}
+
+func TestWSCompressionFrameSizeLimit(t *testing.T) {
+	opts := testWSOptions()
+	opts.MaxPending = MAX_PENDING_SIZE
+	s := &Server{opts: opts}
+	c := &client{srv: s, ws: &websocket{compress: true, browser: true}}
+	c.initClient()
+
+	// uncompressedPayload := []byte("abcdefghijklmnopqrstuvwxyz")
+	uncompressedPayload := make([]byte, 2*wsFrameSizeForBrowsers)
+	for i := 0; i < len(uncompressedPayload); i++ {
+		uncompressedPayload[i] = byte(rand.Intn(256))
+	}
+
+	c.mu.Lock()
+	c.out.nb = append(net.Buffers(nil), uncompressedPayload)
+	nb, _ := c.collapsePtoNB()
+	c.mu.Unlock()
+
+	bb := &bytes.Buffer{}
+	for i, b := range nb {
+		// frame header buffer are always very small. The payload should not be more
+		// than 10 bytes since that is what we passed as the limit.
+		if len(b) > wsFrameSizeForBrowsers {
+			t.Fatalf("Frame size too big: %v (%q)", len(b), b)
+		}
+		// Check frame headers for the proper formatting.
+		if i%2 == 1 {
+			bb.Write(b)
+		}
+	}
+	buf := bb.Bytes()
+	buf = append(buf, 0x00, 0x00, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff)
+	dbr := bytes.NewBuffer(buf)
+	d := flate.NewReader(dbr)
+	uncompressed, err := ioutil.ReadAll(d)
+	if err != nil {
+		t.Fatalf("Error reading frame: %v", err)
+	}
+	if !bytes.Equal(uncompressed, uncompressedPayload) {
+		t.Fatalf("Unexpected uncomressed data: %q", uncompressed)
+	}
+}
+
 // ==================================================================
 // = Benchmark tests
 // ==================================================================
@@ -2245,11 +2432,7 @@ func testWSFlushConn(b *testing.B, compress bool, c net.Conn, br *bufio.Reader) 
 func wsBenchPub(b *testing.B, numPubs int, compress bool, payload string) {
 	b.StopTimer()
 	opts := testWSOptions()
-	opts.DisableShortFirstPing = true
-	opts.Websocket.Host = "127.0.0.1"
-	opts.Websocket.Port = -1
 	opts.Websocket.Compression = compress
-	opts.Websocket.CompressionLevel = defaultCompressionLevel
 	s := RunServer(opts)
 	defer s.Shutdown()
 
@@ -2437,11 +2620,7 @@ func Benchmark_WS_Pubx5_CY_32768b(b *testing.B) {
 func wsBenchSub(b *testing.B, numSubs int, compress bool, payload string) {
 	b.StopTimer()
 	opts := testWSOptions()
-	opts.DisableShortFirstPing = true
-	opts.Websocket.Host = "127.0.0.1"
-	opts.Websocket.Port = -1
 	opts.Websocket.Compression = compress
-	opts.Websocket.CompressionLevel = defaultCompressionLevel
 	s := RunServer(opts)
 	defer s.Shutdown()
 

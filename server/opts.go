@@ -256,22 +256,11 @@ type WebsocketOpts struct {
 	// SameOrigin is false, any origin is accepted.
 	AllowedOrigins []string
 
-	// NOTE: For now, compression is not be supported. Do not use.
-	//
 	// If set to true, the server will negotiate with clients
 	// if compression can be used. If this is false, no compression
 	// will be used (both in server and clients) since it has to
 	// be negotiated between both endpoints
 	Compression bool
-	// Compression level used by compress/flate algorithm.
-	// Possible values are:
-	// -1: default compression
-	// -2: HuffmanOnly
-	//  0: no compression, just adds the necessary DEFLATE framing
-	//  1: best speed
-	// ..
-	//  9: best compression
-	CompressionLevel int
 
 	// Total time allowed for the server to read the client request
 	// and write the response back to the client. This include the
@@ -2844,6 +2833,8 @@ func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]erro
 				*errors = append(*errors, err)
 			}
 			o.Websocket.HandshakeTimeout = ht
+		case "compression":
+			o.Websocket.Compression = mv.(bool)
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
